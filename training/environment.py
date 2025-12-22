@@ -136,13 +136,18 @@ class StockTradingEnv(gym.Env):
         self.prev_shares = 0
         self.prev_price = None
 
-        # Split data into training and testing sets
+        # Load all tickers
         tickers = self.ingestion.read_tickers()
         if ticker_limit:
             tickers = tickers.iloc[:ticker_limit]
 
-        # Create ticker-to-id mapping (using the id column from read_tickers)
-        self.ticker_to_id = dict(zip(tickers["ticker"], tickers["id"]))
+        # Apply tradability filter: remove low-volatility stocks
+        tickers = self._filter_by_tradability(tickers)
+        
+        # Create ticker-to-id mapping with sequential IDs (0 to num_stocks-1)
+        # This ensures stock_id values are always in valid range for embedding layer
+        unique_tickers = tickers["ticker"].unique()
+        self.ticker_to_id = {ticker: idx for idx, ticker in enumerate(unique_tickers)}
         self.num_stocks = len(self.ticker_to_id)
         self.current_stock_id = 0  # Will be updated when loading tickers
 
@@ -150,6 +155,10 @@ class StockTradingEnv(gym.Env):
         self.tickers_train = train_tickers_df["ticker"].to_list()
         self.tickers_test = tickers.drop(train_tickers_df.index)["ticker"].to_list()
 
+        # Initialize random number generator for episode randomization
+        # This will be properly seeded in reset(), but we initialize it here
+        self.np_random = None
+        
         # Initialize values and set mode
         self._reset_values()
         self.set_mode(mode)
@@ -157,10 +166,10 @@ class StockTradingEnv(gym.Env):
 
         assert len(self.tickers) > 0, "No tickers found"
 
-        # New action space: Discrete(3) - Hold, Buy, Sell
-        # Action 0: Hold (do nothing)
-        # Action 1: Buy (convert 100% of cash to stock, minus fees)
-        # Action 2: Sell (convert 100% of shares to cash, minus fees)
+        # New action space: Discrete(3) - Target Positions
+        # Action 0 (Neutral): Close any open position and go to 100% Cash
+        # Action 1 (Long): Close Short (if any) and go 100% Long (max shares possible)
+        # Action 2 (Short): Close Long (if any) and go 100% Short (max shares possible)
         self.action_space = spaces.Discrete(3)
         
         # Track invalid actions for reward calculation
@@ -208,6 +217,90 @@ class StockTradingEnv(gym.Env):
         self.progress_bar.reset()
         self.progress_bar.total = len(self.tickers)
 
+    def _filter_by_tradability(self, tickers: pd.DataFrame) -> pd.DataFrame:
+        """
+        Filter tickers by volatility to ensure they are tradable.
+        
+        Drops stocks where mean absolute percentage change < TRANSACTION_FEE * 1.5.
+        These stocks are too stable to trade profitably after fees.
+        
+        Args:
+            tickers: DataFrame with ticker information
+            seed: Random seed for reproducibility
+            
+        Returns:
+            Filtered DataFrame with only tradable tickers
+        """
+        logger.info("=" * 60)
+        logger.info("APPLYING TRADABILITY FILTER")
+        logger.info("=" * 60)
+        
+        min_volatility = self.config.MIN_VOLATILITY
+        logger.info(
+            f"Minimum volatility threshold: {min_volatility:.6f} "
+        )
+        
+        tradable_tickers = []
+        dropped_count = 0
+        total_count = len(tickers)
+        
+        # Process each ticker
+        for _, row in tickers.iterrows():
+            ticker = row['ticker']
+            
+            try:
+                # Load raw price data (before prep_data to get actual prices)
+                df_raw = self.ingestion.read_prices(ticker)
+                
+                if len(df_raw) == 0:
+                    dropped_count += 1
+                    continue
+                
+                # Calculate volatility: mean absolute percentage change
+                if 'close' in df_raw.columns and len(df_raw) > 1:
+                    prices = df_raw['close'].values
+                    # Calculate percentage changes
+                    pct_changes = np.abs(pd.Series(prices).pct_change().dropna())
+                    volatility_pct = pct_changes.mean()
+                    
+                    if volatility_pct >= min_volatility:
+                        tradable_tickers.append(row)
+                    else:
+                        dropped_count += 1
+                        logger.debug(
+                            f"Dropped {ticker}: volatility={volatility_pct:.6f} "
+                            f"< threshold={min_volatility:.6f}"
+                        )
+                else:
+                    dropped_count += 1
+                    logger.debug(f"Dropped {ticker}: insufficient data")
+                    
+            except Exception as e:
+                dropped_count += 1
+                logger.debug(f"Error processing {ticker} for volatility: {e}")
+                continue
+        
+        # Create filtered DataFrame
+        if tradable_tickers:
+            filtered_df = pd.DataFrame(tradable_tickers).reset_index(drop=True)
+        else:
+            filtered_df = pd.DataFrame(columns=tickers.columns)
+        
+        # Print statistics
+        logger.info("=" * 60)
+        logger.info(
+            f"Tradability Filter Results: "
+            f"Dropped {dropped_count} boring tickers. "
+            f"Training on {len(filtered_df)} volatile tickers."
+        )
+        logger.info(
+            f"Retention rate: {len(filtered_df)/total_count*100:.1f}% "
+            f"({len(filtered_df)}/{total_count})"
+        )
+        logger.info("=" * 60)
+        
+        return filtered_df
+
     def _data_loader(self, ticker: str) -> PricesDf:
         """Load and prepare data for a ticker."""
         df = self.ingestion.read_prices(ticker).prep_data()
@@ -223,22 +316,45 @@ class StockTradingEnv(gym.Env):
         assert not df.isnull().values.any(), f"Data for {ticker} contains NaNs!"
         return df
 
-    def _load_next_df(self, i: int) -> None:
-        """Load the next ticker's data and pre-compute all static features."""
+    def _load_next_df(self, i: int, start_index: Optional[int] = None) -> None:
+        """
+        Load the next ticker's data and pre-compute all static features.
+        
+        Args:
+            i: Ticker index in self.tickers list
+            start_index: Optional starting index within the ticker's history.
+                        If None, starts from beginning. Used for randomization.
+        """
         self.progress_bar.update(1)
         ticker = self.tickers[i]
         self.df = self._data_loader(ticker)
         self.n_steps = len(self.df)
-        self.current_step = 0
-        # Update current stock_id
-        self.current_stock_id = self.ticker_to_id.get(ticker, 0)
         
         # Handle empty dataframe (corrupted ticker data)
         if len(self.df) == 0:
             logger.warning(f"Ticker {ticker} has no data. Will skip to next ticker.")
             return
         
-        logger.debug(f"Loaded {self.n_steps:,} rows for {ticker} (stock_id={self.current_stock_id})")
+        # Update current stock_id
+        self.current_stock_id = self.ticker_to_id.get(ticker, 0)
+        
+        # If start_index is provided and valid, slice the dataframe
+        # This allows randomization while preserving time-series order
+        if start_index is not None and start_index > 0:
+            if start_index < self.n_steps:
+                # Slice from start_index to end (preserves time order)
+                self.df = self.df.iloc[start_index:].reset_index(drop=True)
+                self.n_steps = len(self.df)
+            else:
+                # Invalid start_index, use from beginning
+                start_index = 0
+        
+        self.current_step = 0
+        
+        logger.debug(
+            f"Loaded {self.n_steps:,} rows for {ticker} "
+            f"(stock_id={self.current_stock_id}, start_idx={start_index or 0})"
+        )
         self._reset_values()
         
         # Pre-compute all static features for performance
@@ -378,23 +494,47 @@ class StockTradingEnv(gym.Env):
         current_price = self.prices_array[self.current_step] if self.current_step < len(self.prices_array) else 0.0
         
         # Calculate account state (only dynamic feature)
-        position_ratio = 1.0 if self.shares_held > 0 else 0.0
+        # Position_Ratio: Normalized to -1.0 (short) to +1.0 (long), 0.0 (neutral)
+        if self.shares_held > 0:
+            position_ratio = 1.0  # Long
+        elif self.shares_held < 0:
+            position_ratio = -1.0  # Short
+        else:
+            position_ratio = 0.0  # Neutral
         
         # Unrealized_PnL_Pct: (current_value - cost_basis) / cost_basis
-        if self.shares_held > 0 and hasattr(self, 'holdings') and self.holdings:
-            # Calculate average cost basis
-            total_cost = sum(h[0] * h[2] for h in self.holdings if h[2] > 0)
-            total_shares = sum(h[2] for h in self.holdings if h[2] > 0)
-            if total_shares > 0:
-                avg_cost = total_cost / total_shares
-                current_value = self.shares_held * current_price
-                cost_basis = self.shares_held * avg_cost
-                unrealized_pnl_pct = (
-                    (current_value - cost_basis) / cost_basis
-                    if cost_basis > 0 else 0.0
-                )
+        # Handles both long and short positions
+        if self.shares_held != 0 and hasattr(self, 'holdings') and self.holdings:
+            if self.shares_held > 0:
+                # Long position: calculate PnL from cost basis
+                total_cost = sum(h[0] * h[2] for h in self.holdings if h[2] > 0)
+                total_shares = sum(h[2] for h in self.holdings if h[2] > 0)
+                if total_shares > 0:
+                    avg_cost = total_cost / total_shares
+                    current_value = self.shares_held * current_price
+                    cost_basis = self.shares_held * avg_cost
+                    unrealized_pnl_pct = (
+                        (current_value - cost_basis) / cost_basis
+                        if cost_basis > 0 else 0.0
+                    )
+                else:
+                    unrealized_pnl_pct = 0.0
             else:
-                unrealized_pnl_pct = 0.0
+                # Short position: PnL is inverse (profit when price drops)
+                short_shares = abs(self.shares_held)
+                if self.holdings and len(self.holdings) > 0:
+                    short_entry_price = self.holdings[0][0]  # Entry price
+                    # PnL for short: (entry_value - current_liability) / entry_value
+                    entry_value = short_shares * short_entry_price
+                    current_liability = short_shares * current_price
+                    if entry_value > 0:
+                        unrealized_pnl_pct = (
+                            (entry_value - current_liability) / entry_value
+                        )
+                    else:
+                        unrealized_pnl_pct = 0.0
+                else:
+                    unrealized_pnl_pct = 0.0
         else:
             unrealized_pnl_pct = 0.0
         
@@ -525,17 +665,170 @@ class StockTradingEnv(gym.Env):
         
         return float(reward)
 
+    def _take_action(self, target_position: int, current_price: float) -> Tuple[str, bool]:
+        """
+        Execute action to reach target position with proper fee handling.
+        
+        Args:
+            target_position: 0=Neutral, 1=Long, 2=Short
+            current_price: Current market price
+            
+        Returns:
+            Tuple of (action_name, trade_executed)
+        """
+        current_shares = self.shares_held
+        action_name = "neutral"
+        trade_executed = False
+        
+        # Determine current position state
+        is_long = current_shares > 0
+        is_short = current_shares < 0
+        is_neutral = current_shares == 0
+        
+        if target_position == 0:  # Neutral: Close any position
+            if is_long:
+                # Close long position (pay fee once)
+                self._close_long_position(current_price)
+                action_name = "neutral"
+                trade_executed = True
+            elif is_short:
+                # Close short position (pay fee once)
+                self._close_short_position(current_price)
+                action_name = "neutral"
+                trade_executed = True
+            else:
+                # Already neutral
+                action_name = "neutral"
+                trade_executed = False
+                
+        elif target_position == 1:  # Long: Go 100% long
+            if is_short:
+                # Short -> Long: Close short + Open long (2x fee)
+                self._close_short_position(current_price)
+                # Now open long (won't close anything since we're neutral)
+                self._open_long_position_direct(current_price)
+                action_name = "long"
+                trade_executed = True
+            elif is_neutral:
+                # Neutral -> Long: Open long (1x fee)
+                self._open_long_position_direct(current_price)
+                action_name = "long"
+                trade_executed = True
+            elif is_long:
+                # Already long, rebalance to max
+                self._close_long_position(current_price)
+                self._open_long_position_direct(current_price)
+                action_name = "long"
+                trade_executed = True
+                
+        elif target_position == 2:  # Short: Go 100% short
+            if is_long:
+                # Long -> Short: Close long + Open short (2x fee)
+                self._close_long_position(current_price)
+                # Now open short (won't close anything since we're neutral)
+                self._open_short_position_direct(current_price)
+                action_name = "short"
+                trade_executed = True
+            elif is_neutral:
+                # Neutral -> Short: Open short (1x fee)
+                self._open_short_position_direct(current_price)
+                action_name = "short"
+                trade_executed = True
+            elif is_short:
+                # Already short, rebalance to max
+                self._close_short_position(current_price)
+                self._open_short_position_direct(current_price)
+                action_name = "short"
+                trade_executed = True
+        
+        return action_name, trade_executed
+    
+    def _close_long_position(self, current_price: float) -> None:
+        """Close all long positions (sell all positive shares)."""
+        if self.shares_held > 0:
+            # Sell all shares
+            shares_to_sell = self.shares_held
+            shares_value = shares_to_sell * current_price
+            # Apply transaction fee
+            sale_val = shares_value * (1 - self.config.TRANSACTION_FEE)
+            self.balance += sale_val
+            self.shares_held = 0
+            self.holdings = []  # Clear holdings tracking
+    
+    def _close_short_position(self, current_price: float) -> None:
+        """Close all short positions (buy back negative shares)."""
+        if self.shares_held < 0:
+            # Buy back shorted shares
+            shares_to_buy = abs(self.shares_held)
+            cost_per_share = current_price * (1 + self.config.TRANSACTION_FEE)
+            cost = shares_to_buy * cost_per_share
+            self.balance -= cost
+            self.shares_held = 0
+            self.holdings = []  # Clear holdings tracking
+    
+    def _open_long_position(self, current_price: float) -> None:
+        """Open maximum long position (closes shorts first if needed)."""
+        # Close any existing short position if present
+        if self.shares_held < 0:
+            self._close_short_position(current_price)
+        self._open_long_position_direct(current_price)
+    
+    def _open_long_position_direct(self, current_price: float) -> None:
+        """Open maximum long position (assumes neutral position)."""
+        if current_price <= 0:
+            return
+        
+        # Calculate max shares we can buy with current net worth
+        net_worth = self.balance + (self.shares_held * current_price if self.shares_held != 0 else 0)
+        cost_per_share = current_price * (1 + self.config.TRANSACTION_FEE)
+        max_shares = int(net_worth / cost_per_share)
+        
+        if max_shares > 0:
+            cost = max_shares * cost_per_share
+            self.balance -= cost
+            self.shares_held = max_shares
+            # Update holdings tracking
+            self.holdings = [(current_price, current_price, max_shares, max_shares)]
+    
+    def _open_short_position(self, current_price: float) -> None:
+        """Open maximum short position (closes longs first if needed)."""
+        # Close any existing long position if present
+        if self.shares_held > 0:
+            self._close_long_position(current_price)
+        self._open_short_position_direct(current_price)
+    
+    def _open_short_position_direct(self, current_price: float) -> None:
+        """Open maximum short position (assumes neutral position)."""
+        if current_price <= 0:
+            return
+        
+        # Calculate max shares we can short based on net worth
+        # For shorting: we can short shares worth up to net worth (with margin consideration)
+        net_worth = self.balance + (self.shares_held * current_price if self.shares_held != 0 else 0)
+        # Account for transaction fee: can short shares worth (net_worth * (1 - fee))
+        shares_value_limit = net_worth * (1 - self.config.TRANSACTION_FEE)
+        max_shares_to_short = int(shares_value_limit / current_price)
+        
+        if max_shares_to_short > 0:
+            # Short selling: we receive proceeds minus fee
+            # When shorting: sell shares we don't own, receive cash (minus fee)
+            proceeds = max_shares_to_short * current_price * (1 - self.config.TRANSACTION_FEE)
+            self.balance += proceeds
+            self.shares_held = -max_shares_to_short  # Negative for short
+            # Track short position (entry price, shares are negative)
+            self.holdings = [(current_price, current_price, -max_shares_to_short, -max_shares_to_short)]
+
     def step(self, action) -> Tuple[np.ndarray, float, bool, bool, Dict]:
         """
         Execute an action and return the result.
         
-        Action space: Discrete(3)
-        - 0: Hold (do nothing)
-        - 1: Buy (convert 100% of cash to stock, minus fees)
-        - 2: Sell (convert 100% of shares to cash, minus fees)
+        Action space: Discrete(3) - Target Positions
+        - 0 (Neutral): Close any position and go to 100% Cash
+        - 1 (Long): Close Short (if any) and go 100% Long
+        - 2 (Short): Close Long (if any) and go 100% Short
 
         Args:
-            action: Action index (0=Hold, 1=Buy, 2=Sell)
+            action: Action index (0=Neutral, 1=Long, 2=Short)
 
         Returns:
             Tuple of (observation, reward, done, truncated, info)
@@ -550,55 +843,32 @@ class StockTradingEnv(gym.Env):
         
         # Track invalid action
         self.is_invalid_action = False
-        action_name = "hold"
-        trade_executed = False
         
-        # Execute action based on Discrete(3) action space
+        # Execute action based on target position
         action_idx = int(action)
+        if action_idx not in [0, 1, 2]:
+            logger.warning(f"Invalid action index: {action_idx}. Defaulting to neutral.")
+            action_idx = 0
         
-        if action_idx == 0:  # Hold
-            self.hold(current_price)
-            action_name = "hold"
-            trade_executed = False
-            
-        elif action_idx == 1:  # Buy
-            # Check if we can afford at least 1 share
-            min_cost = current_price * (1 + self.config.TRANSACTION_FEE)
-            if self.balance < min_cost:
-                # Invalid action: cannot afford even 1 share
-                self.is_invalid_action = True
-                self.hold(current_price)
-                action_name = "hold"  # Forced hold
-                trade_executed = False
-            else:
-                # Valid buy: convert 100% of cash to stock
-                self.buy(current_price, proportion=1.0)
-                action_name = "buy"
-                trade_executed = True
-                
-        elif action_idx == 2:  # Sell
-            # Check if we have shares to sell
-            if self.shares_held == 0:
-                # Invalid action: no shares to sell
-                self.is_invalid_action = True
-                self.hold(current_price)
-                action_name = "hold"  # Forced hold
-                trade_executed = False
-            else:
-                # Valid sell: convert 100% of shares to cash
-                self.sell(current_price, proportion=1.0)
-                action_name = "sell"
-                trade_executed = True
-        else:
-            # Invalid action index
-            logger.warning(f"Invalid action index: {action_idx}. Defaulting to hold.")
-            self.hold(current_price)
-            action_name = "hold"
-            trade_executed = False
+        action_name, trade_executed = self._take_action(action_idx, current_price)
 
-        # Update net worth
+        # Update net worth (handles both long and short positions)
+        # For shorts: shares_held is negative, so holdings_value is negative
         self.holdings_value = self.shares_held * current_price
         self.net_worth = self.balance + self.holdings_value
+        
+        # Bankruptcy "Kill Switch": Shorting has infinite risk
+        if self.net_worth <= 0:
+            logger.warning(
+                f"Bankruptcy detected! Net worth: {self.net_worth:.2f}, "
+                f"Shares: {self.shares_held}, Balance: {self.balance:.2f}"
+            )
+            reward = -100.0  # Heavy punishment
+            self.done = True
+            return self._next_observation(), reward, self.done, False, {
+                "bankruptcy": True,
+                "net_worth": self.net_worth,
+            }
         
         if np.isnan(self.net_worth) or np.isinf(self.net_worth):
             logger.error("Net worth became NaN or Inf!")
@@ -650,7 +920,7 @@ class StockTradingEnv(gym.Env):
         return self._next_observation(), reward, self.done, False, info
 
     def _load_df_loop(self) -> None:
-        """Handle end of ticker data and load next."""
+        """Handle end of ticker data and load next with randomization."""
         final_net_worth = self.end_run()
         self.recent_net_worths.append(final_net_worth)
         self.recent_run_mean_return = float(np.mean(self.recent_net_worths))
@@ -663,9 +933,15 @@ class StockTradingEnv(gym.Env):
         attempts = 0
         
         while attempts < max_attempts:
-            self.ticker_count += 1
-            if self.ticker_count >= len(self.tickers):
-                self.ticker_count = 0
+            # Randomly select a ticker for better exploration
+            if hasattr(self, 'np_random') and self.np_random is not None:
+                ticker_idx = self.np_random.integers(0, len(self.tickers))
+            else:
+                # Fallback: sequential
+                self.ticker_count += 1
+                if self.ticker_count >= len(self.tickers):
+                    self.ticker_count = 0
+                ticker_idx = self.ticker_count
             
             if self.timesteps is not None and self.current_step >= self.timesteps:
                 self.done = True
@@ -673,7 +949,22 @@ class StockTradingEnv(gym.Env):
                 self.full_reset = True
                 return
             
-            self._load_next_df(self.ticker_count)
+            # Randomize start position within the ticker's history
+            ticker = self.tickers[ticker_idx]
+            df_temp = self._data_loader(ticker)
+            
+            if len(df_temp) > 0:
+                # Randomly select a start index (leave room for obs_window_size)
+                max_start = max(0, len(df_temp) - self.obs_window_size - 1)
+                if hasattr(self, 'np_random') and self.np_random is not None:
+                    start_index = self.np_random.integers(0, max_start + 1) if max_start > 0 else 0
+                else:
+                    start_index = 0
+                self._load_next_df(ticker_idx, start_index=start_index)
+            else:
+                # Fallback: load from beginning
+                self._load_next_df(ticker_idx, start_index=None)
+            
             attempts += 1
             
             # If we successfully loaded data, break out of the loop
@@ -817,7 +1108,13 @@ class StockTradingEnv(gym.Env):
         self, seed: Optional[int] = None, options: Optional[dict] = None
     ) -> Tuple[np.ndarray, Dict]:
         """
-        Reset the environment.
+        Reset the environment with randomized stock selection and start position.
+        
+        Randomizes:
+        - Which ticker to use (from filtered tradable list)
+        - Starting index within that ticker's history
+        
+        Does NOT shuffle time-series data (preserves Buy->Hold->Sell sequence).
 
         Args:
             seed: Random seed
@@ -827,17 +1124,54 @@ class StockTradingEnv(gym.Env):
             Tuple of (observation, info)
         """
         super().reset(seed=seed, options=options)
+        
+        # Ensure np_random is available (initialized by super().reset())
+        # Gymnasium's reset() should set self.np_random, but we add a fallback
+        if not hasattr(self, 'np_random') or self.np_random is None:
+            # Fallback: use numpy random if gymnasium didn't initialize it
+            rng = np.random.RandomState(seed)
+            self.np_random = rng
+        
+        # Randomize ticker selection and start position
+        if len(self.tickers) > 0:
+            # Randomly select a ticker
+            ticker_idx = self.np_random.integers(0, len(self.tickers))
+            
+            # Load the ticker's data to get its length
+            ticker = self.tickers[ticker_idx]
+            df_temp = self._data_loader(ticker)
+            
+            if len(df_temp) > 0:
+                # Randomly select a start index (leave room for at least obs_window_size steps)
+                max_start = max(0, len(df_temp) - self.obs_window_size - 1)
+                start_index = self.np_random.integers(0, max_start + 1) if max_start > 0 else 0
+                
+                # Load with randomized start position
+                self._load_next_df(ticker_idx, start_index=start_index)
+            else:
+                # Fallback: load from beginning if data is empty
+                self._load_next_df(ticker_idx, start_index=None)
+        else:
+            # Fallback: use first ticker if list is empty
+            self._load_next_df(0, start_index=None)
+        
         self._reset_values()
+        
         # Initialize previous_price to first price for proper stock return calculation
         if hasattr(self, 'df') and len(self.df) > 0:
             self.previous_price = self.df.iloc[0]["raw_close"]
+        
         return self._next_observation(), {}
 
     def end_run(self) -> float:
         """End current run and return net worth."""
         if len(self.df):
             current_price = self.df.iloc[-1]["raw_close"]
-            self.sell(current_price, proportion=1.0)
+            # Close any open position (long or short)
+            if self.shares_held > 0:
+                self._close_long_position(current_price)
+            elif self.shares_held < 0:
+                self._close_short_position(current_price)
             self.holdings_value = self.shares_held * current_price
             self.net_worth = self.balance + self.holdings_value
         return self.net_worth

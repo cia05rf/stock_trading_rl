@@ -219,6 +219,9 @@ class MultiScaleActorCriticPolicy(ActorCriticPolicy):
             stock_id = self.current_stock_id.to(device)
             if stock_id.shape[0] == 1 and batch_size > 1:
                 stock_id = stock_id.repeat(batch_size)
+            # Clamp stock_id to valid range [0, num_stocks-1] to prevent embedding errors
+            if self.num_stocks > 0:
+                stock_id = torch.clamp(stock_id, 0, self.num_stocks - 1)
             return stock_id
         return None
 

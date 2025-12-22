@@ -141,6 +141,9 @@ class MultiScaleActorCritic(nn.Module):
         
         # Ensure stock_id is on the same device as features
         stock_id = stock_id.to(lstm_features.device)
+        # Clamp stock_id to valid range [0, num_stocks-1] to prevent embedding index errors
+        if self.num_stocks > 0:
+            stock_id = torch.clamp(stock_id, 0, self.num_stocks - 1)
         embedded_id = self.stock_embedding(stock_id)
         
         # Concatenate LSTM features with stock embedding

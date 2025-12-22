@@ -484,6 +484,11 @@ class Config:
         return float(os.getenv("TRANSACTION_COST", str(self.TRANSACTION_FEE)))
     
     @property
+    def MIN_VOLATILITY(self) -> float:
+        """Minimum volatility threshold for tradability. Baseline set to TRANSACTION_FEE * 1.5"""
+        return float(os.getenv("MIN_VOLATILITY", "0.005"))
+    
+    @property
     def ARTIFICIAL_DECAY(self) -> float:
         """Artificial decay to encourage action (negative value applies time decay urgency)."""
         return float(os.getenv("ARTIFICIAL_DECAY", "-0.0001"))
