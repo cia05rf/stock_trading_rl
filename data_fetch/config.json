@@ -1,0 +1,126 @@
+{
+  "_comment": "Configuration file for intraday-price-fetch project. API_KEY is stored in .env file.",
+  
+  "paths": {
+    "data_dir": "../data",
+    "output_dir": "../data",
+    "hdf5_file": "../data/prices_highly_liquid.h5",
+    "symbol_lists_file": "../data/symbol_lists.json",
+    "symbol_lists_augmented_file": "../data/symbol_lists_st_en.json"
+  },
+  
+  "api": {
+    "base_url": "https://eodhd.com/api",
+    "daily_limit": 100000
+  },
+  
+  "dates": {
+    "start_date": "2020-10-01",
+    "end_date": "2025-12-10",
+    "train_end_date": "2024-01-01",
+    "val_end_date": "2024-07-01"
+  },
+  
+  "rate_limiting": {
+    "scraper": {
+      "calls_per_minute": 1000,
+      "rate_limit_buffer": 0.95,
+      "rate_limit_window_seconds": 30
+    },
+    "augment": {
+      "calls_per_minute": 100,
+      "rate_limit_buffer": 0.95,
+      "rate_limit_window_seconds": 10
+    }
+  },
+  
+  "processing": {
+    "request_timeout_seconds": 30,
+    "max_concurrent_requests": 50,
+    "max_concurrent_requests_augment": 5,
+    "chunk_size_days": 120,
+    "batch_write_size": 10000,
+    "retry_attempts": 3,
+    "retry_delay_seconds": 1,
+    "batch_size": 100
+  },
+  
+  "test_mode": {
+    "tickers_limit": 3,
+    "records_limit": 3
+  },
+  
+  "datamodule": {
+    "sequence_length": 60,
+    "batch_size": 64,
+    "train_split": 0.7,
+    "val_split": 0.15,
+    "num_workers": 0,
+    "pin_memory": true,
+    "normalize": true,
+    "include_volume": true,
+    "include_value": false,
+    "target_type": "returns",
+    "respect_ticker_boundaries": true,
+    "split_by_date": true
+  },
+  
+  "exchanges": {
+    "US_STOCKS": {
+      "exchange_code": "US",
+      "output_exchange": "US",
+      "description": "US Common Stocks (NASDAQ/NYSE)",
+      "allowed_exchanges": ["NASDAQ", "NYSE", "NYSE ARCA", "NYSE MKT"],
+      "allowed_types": ["Common Stock"]
+    },
+    "LSE_STOCKS": {
+      "exchange_code": "LSE",
+      "output_exchange": "LSE",
+      "description": "London Stock Exchange Common Stocks",
+      "allowed_exchanges": null,
+      "allowed_types": ["Common Stock"]
+    }
+  },
+  
+  "currencies": [
+    ["EURUSD", "FOREX"],
+    ["GBPUSD", "FOREX"],
+    ["USDJPY", "FOREX"],
+    ["USDCHF", "FOREX"],
+    ["AUDUSD", "FOREX"],
+    ["USDCAD", "FOREX"],
+    ["NZDUSD", "FOREX"],
+    ["EURGBP", "FOREX"],
+    ["EURJPY", "FOREX"],
+    ["GBPJPY", "FOREX"]
+  ],
+  
+  "cryptos": [
+    ["BTC-USD", "CC"],
+    ["ETH-USD", "CC"],
+    ["BNB-USD", "CC"],
+    ["XRP-USD", "CC"],
+    ["ADA-USD", "CC"],
+    ["SOL-USD", "CC"],
+    ["DOGE-USD", "CC"],
+    ["DOT-USD", "CC"],
+    ["MATIC-USD", "CC"],
+    ["LTC-USD", "CC"],
+    ["SHIB-USD", "CC"],
+    ["AVAX-USD", "CC"],
+    ["LINK-USD", "CC"],
+    ["UNI-USD", "CC"],
+    ["XLM-USD", "CC"]
+  ],
+  
+  "api_usage_estimates": {
+    "symbol_counts": {
+      "SP500": 500,
+      "DAX": 40,
+      "FTSE350": 350,
+      "CURRENCY": 50,
+      "CRYPTO": 50
+    }
+  }
+}
+
