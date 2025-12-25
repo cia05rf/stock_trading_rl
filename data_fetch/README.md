@@ -191,6 +191,21 @@ uv run python price_scraper.py
 uv run python convert_to_hdf5.py --output ../data/prices_all_1m.h5
 ```
 
+Run for all prices:
+```bash
+python convert_to_hdf5.py --data-dir ../data --output ../data/prices_all.h5 --preset all
+```
+
+Run for liquid prices:
+```bash
+ python convert_to_hdf5.py --data-dir ../data --output ../data/prices_liquid.h5 --preset liquid
+```
+
+Run for highly liquid prices:
+```bash
+python convert_to_hdf5.py --data-dir ../data --output ../data/prices_highly_liquid.h5 --preset highly_liquid
+```
+
 ### HDF5 layout (what’s inside)
 
 The `.h5` file is a set of aligned arrays (concatenated across tickers) plus lookup tables:

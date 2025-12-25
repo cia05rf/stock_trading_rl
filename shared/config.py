@@ -462,8 +462,19 @@ class Config:
     
     @property
     def TRANSACTION_FEE(self) -> float:
-        """Transaction fee percentage (0.1% = 0.001). The model must learn to overcome spread/fees."""
-        return float(os.getenv("TRANSACTION_FEE", "0.001"))
+        """
+        Starting transaction fee percentage (0.0 = Zero).
+        Curriculum learning starts with zero fees to let agent learn basic patterns.
+        """
+        return float(os.getenv("TRANSACTION_FEE", "0.0"))
+    
+    @property
+    def TARGET_TRANSACTION_FEE(self) -> float:
+        """
+        Target transaction fee percentage (0.1% = 0.001).
+        The final goal fee that will be reached by the end of training.
+        """
+        return float(os.getenv("TARGET_TRANSACTION_FEE", "0.001"))
     
     @property
     def INVALID_ACTION_PENALTY(self) -> float:
@@ -486,7 +497,7 @@ class Config:
     @property
     def MIN_VOLATILITY(self) -> float:
         """Minimum volatility threshold for tradability. Baseline set to TRANSACTION_FEE * 1.5"""
-        return float(os.getenv("MIN_VOLATILITY", "0.005"))
+        return float(os.getenv("MIN_VOLATILITY", "0.0015"))
     
     @property
     def ARTIFICIAL_DECAY(self) -> float:
@@ -524,12 +535,32 @@ class Config:
         return float(os.getenv("LEARNING_RATE_END", "1e-5"))
     
     @property
+    def LR_WARMUP_START(self) -> float:
+        """Starting learning rate for warmup (low initial value)."""
+        return float(os.getenv("LR_WARMUP_START", "1e-5"))
+    
+    @property
+    def LR_PEAK(self) -> float:
+        """Peak learning rate after warmup (high value)."""
+        return float(os.getenv("LR_PEAK", "3e-4"))
+    
+    @property
+    def LR_WARMUP_FRACTION(self) -> float:
+        """Fraction of training for warmup phase."""
+        return float(os.getenv("LR_WARMUP_FRACTION", "0.1"))
+    
+    @property
+    def LR_DECAY_FRACTION(self) -> float:
+        """Fraction of training for decay phase (after warmup)."""
+        return float(os.getenv("LR_DECAY_FRACTION", "0.8"))
+    
+    @property
     def ENTROPY_COEF(self) -> float:
         """
         Entropy coefficient.
         INCREASED from 0.05 to 0.2 to force the agent out of the "Wait" local optimum.
         """
-        return float(os.getenv("ENTROPY_COEF", "0.2"))
+        return float(os.getenv("ENTROPY_COEF", "0.05"))
     
     @property
     def CASH_DECAY(self) -> float:

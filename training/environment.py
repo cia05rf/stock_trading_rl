@@ -108,8 +108,11 @@ class StockTradingEnv(gym.Env):
         self.initial_balance = initial_balance
         self.window_size = window_size
         self.obs_window_size = self.config.OBS_WINDOW_SIZE
-        # Use TRANSACTION_FEE from config (transaction_cost_pct is deprecated)
-        self.transaction_cost_pct = self.config.TRANSACTION_FEE
+        # Dynamic transaction fee for curriculum learning
+        # Will be calculated based on training progress
+        self.total_training_steps = None  # Set via set_total_training_steps()
+        self.global_step_count = 0  # Track total steps across all episodes
+        self.transaction_cost_pct = self.config.TRANSACTION_FEE  # Starting fee (0.0)
         self.stamp_duty_pct = stamp_duty_pct
         self.trade_penalty = trade_penalty
         self.risk_factor = risk_factor
@@ -130,7 +133,7 @@ class StockTradingEnv(gym.Env):
         self.holdings: List[Tuple] = []  # (price, avco, change, shares_held)
         self.returns: List[float] = []
         self.net_worth_history: List[float] = []
-        
+
         # Track previous values for reward calculation
         self.prev_balance = initial_balance
         self.prev_shares = 0
@@ -158,7 +161,7 @@ class StockTradingEnv(gym.Env):
         # Initialize random number generator for episode randomization
         # This will be properly seeded in reset(), but we initialize it here
         self.np_random = None
-        
+
         # Initialize values and set mode
         self._reset_values()
         self.set_mode(mode)
@@ -235,9 +238,11 @@ class StockTradingEnv(gym.Env):
         logger.info("APPLYING TRADABILITY FILTER")
         logger.info("=" * 60)
         
-        min_volatility = self.config.MIN_VOLATILITY
+        # Use TARGET_TRANSACTION_FEE for filtering (we want stocks tradable at final fee)
+        min_volatility = self.config.TARGET_TRANSACTION_FEE * 1.5
         logger.info(
             f"Minimum volatility threshold: {min_volatility:.6f} "
+            f"(based on TARGET_TRANSACTION_FEE={self.config.TARGET_TRANSACTION_FEE})"
         )
         
         tradable_tickers = []
@@ -614,7 +619,7 @@ class StockTradingEnv(gym.Env):
     def calculate_reward(self) -> float:
         """
         Calculate reward using Logarithmic Wealth Growth strategy with Conditional Cash Decay.
-        
+
         Formula: 
         1. Log Return: log((current_val + eps) / (prev_val + eps)) * 100
         2. Conditional Cash Decay: CASH_DECAY * cash_ratio (only penalizes cash portion)
@@ -624,7 +629,7 @@ class StockTradingEnv(gym.Env):
         - 100% Cash -> Full decay penalty
         - 0% Cash (fully invested) -> No decay penalty
         This incentivizes the agent to invest rather than hold cash.
-        
+
         Returns:
             Reward value based on logarithmic portfolio growth with conditional decay
         """
@@ -657,22 +662,22 @@ class StockTradingEnv(gym.Env):
         # 3. Invalid Action Penalty
         if self.is_invalid_action:
             reward -= self.config.INVALID_ACTION_PENALTY
-        
+
         # Validate and handle edge cases
         if np.isnan(reward) or np.isinf(reward):
             logger.warning(f"Invalid reward: {reward}. Setting to 0.")
             reward = 0.0
-        
+
         return float(reward)
 
     def _take_action(self, target_position: int, current_price: float) -> Tuple[str, bool]:
         """
         Execute action to reach target position with proper fee handling.
-        
+
         Args:
             target_position: 0=Neutral, 1=Long, 2=Short
             current_price: Current market price
-            
+
         Returns:
             Tuple of (action_name, trade_executed)
         """
@@ -749,8 +754,9 @@ class StockTradingEnv(gym.Env):
             # Sell all shares
             shares_to_sell = self.shares_held
             shares_value = shares_to_sell * current_price
-            # Apply transaction fee
-            sale_val = shares_value * (1 - self.config.TRANSACTION_FEE)
+            # Apply transaction fee (dynamic)
+            current_fee = self._get_current_transaction_fee()
+            sale_val = shares_value * (1 - current_fee)
             self.balance += sale_val
             self.shares_held = 0
             self.holdings = []  # Clear holdings tracking
@@ -760,7 +766,8 @@ class StockTradingEnv(gym.Env):
         if self.shares_held < 0:
             # Buy back shorted shares
             shares_to_buy = abs(self.shares_held)
-            cost_per_share = current_price * (1 + self.config.TRANSACTION_FEE)
+            current_fee = self._get_current_transaction_fee()
+            cost_per_share = current_price * (1 + current_fee)
             cost = shares_to_buy * cost_per_share
             self.balance -= cost
             self.shares_held = 0
@@ -780,7 +787,8 @@ class StockTradingEnv(gym.Env):
         
         # Calculate max shares we can buy with current net worth
         net_worth = self.balance + (self.shares_held * current_price if self.shares_held != 0 else 0)
-        cost_per_share = current_price * (1 + self.config.TRANSACTION_FEE)
+        current_fee = self._get_current_transaction_fee()
+        cost_per_share = current_price * (1 + current_fee)
         max_shares = int(net_worth / cost_per_share)
         
         if max_shares > 0:
@@ -806,17 +814,57 @@ class StockTradingEnv(gym.Env):
         # For shorting: we can short shares worth up to net worth (with margin consideration)
         net_worth = self.balance + (self.shares_held * current_price if self.shares_held != 0 else 0)
         # Account for transaction fee: can short shares worth (net_worth * (1 - fee))
-        shares_value_limit = net_worth * (1 - self.config.TRANSACTION_FEE)
+        current_fee = self._get_current_transaction_fee()
+        shares_value_limit = net_worth * (1 - current_fee)
         max_shares_to_short = int(shares_value_limit / current_price)
         
         if max_shares_to_short > 0:
             # Short selling: we receive proceeds minus fee
             # When shorting: sell shares we don't own, receive cash (minus fee)
-            proceeds = max_shares_to_short * current_price * (1 - self.config.TRANSACTION_FEE)
+            proceeds = max_shares_to_short * current_price * (1 - current_fee)
             self.balance += proceeds
             self.shares_held = -max_shares_to_short  # Negative for short
             # Track short position (entry price, shares are negative)
             self.holdings = [(current_price, current_price, -max_shares_to_short, -max_shares_to_short)]
+    
+    def set_total_training_steps(self, total_steps: int) -> None:
+        """
+        Set the total number of training steps for curriculum learning.
+        
+        Args:
+            total_steps: Total number of training timesteps
+        """
+        self.total_training_steps = total_steps
+        logger.info(f"Set total training steps to {total_steps:,} for curriculum learning")
+    
+    def _get_current_transaction_fee(self) -> float:
+        """
+        Calculate current transaction fee based on training progress.
+        
+        Curriculum Learning Strategy:
+        - First 10% of training: 0.0 fee (safe space to learn patterns)
+        - After 10%: Linear ramp from 0.0 to TARGET_TRANSACTION_FEE
+        
+        Returns:
+            Current transaction fee (0.0 to TARGET_TRANSACTION_FEE)
+        """
+        # If total_training_steps not set, use starting fee
+        if self.total_training_steps is None or self.total_training_steps == 0:
+            return self.config.TRANSACTION_FEE
+        
+        # Calculate progress (0.0 to 1.0)
+        progress = min(self.global_step_count / self.total_training_steps, 1.0)
+        
+        # First 10% of training: force fee to 0.0 (safe space)
+        if progress < 0.1:
+            return 0.0
+        
+        # After 10%: Linear ramp from 0.0 to TARGET_TRANSACTION_FEE
+        # Adjust progress to start from 0.1 (so progress 0.1 -> 0.0, progress 1.0 -> 1.0)
+        adjusted_progress = (progress - 0.1) / 0.9  # Maps [0.1, 1.0] to [0.0, 1.0]
+        current_fee = self.config.TARGET_TRANSACTION_FEE * adjusted_progress
+        
+        return float(current_fee)
 
     def step(self, action) -> Tuple[np.ndarray, float, bool, bool, Dict]:
         """
@@ -851,6 +899,12 @@ class StockTradingEnv(gym.Env):
             action_idx = 0
         
         action_name, trade_executed = self._take_action(action_idx, current_price)
+        
+        # Update global step count for curriculum learning
+        self.global_step_count += 1
+        
+        # Calculate current transaction fee (for logging)
+        current_fee = self._get_current_transaction_fee()
 
         # Update net worth (handles both long and short positions)
         # For shorts: shares_held is negative, so holdings_value is negative
@@ -908,6 +962,8 @@ class StockTradingEnv(gym.Env):
             "profit_loss": profit_loss,
             "trade_executed": trade_executed,
             "invalid_action": self.is_invalid_action,
+            "current_transaction_fee": current_fee,  # Log dynamic fee for curriculum learning
+            "training_progress": min(self.global_step_count / self.total_training_steps, 1.0) if self.total_training_steps else 0.0,
         }
 
         # Advance step
@@ -938,10 +994,10 @@ class StockTradingEnv(gym.Env):
                 ticker_idx = self.np_random.integers(0, len(self.tickers))
             else:
                 # Fallback: sequential
+                ticker_idx = self.ticker_count
                 self.ticker_count += 1
                 if self.ticker_count >= len(self.tickers):
                     self.ticker_count = 0
-                ticker_idx = self.ticker_count
             
             if self.timesteps is not None and self.current_step >= self.timesteps:
                 self.done = True
@@ -1022,7 +1078,8 @@ class StockTradingEnv(gym.Env):
                 
                 shares_value = this_shares * current_price
                 # Apply transaction fee: sale value = shares_value * (1 - fee)
-                sale_val = shares_value * (1 - self.config.TRANSACTION_FEE)
+                current_fee = self._get_current_transaction_fee()
+                sale_val = shares_value * (1 - current_fee)
                 
                 self.total_sales_value += sale_val
                 self.balance += sale_val
@@ -1054,7 +1111,8 @@ class StockTradingEnv(gym.Env):
         # Calculate shares to buy with available cash (after fees)
         available_cash = self.balance * proportion
         # Account for transaction fee: cost per share = price * (1 + fee)
-        cost_per_share = current_price * (1 + self.config.TRANSACTION_FEE)
+        current_fee = self._get_current_transaction_fee()
+        cost_per_share = current_price * (1 + current_fee)
         shares_to_buy = int(available_cash / cost_per_share)
         
         if shares_to_buy > 0:

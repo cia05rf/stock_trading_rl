@@ -29,6 +29,10 @@ intraday-price-fetch/
 │   ├── backtest.py          # Mock fund backtesting
 │   └── analysis.py          # Performance analysis
 │
+├── charting/            # Visualization tools
+│   ├── visualize_prices.py  # Candlestick chart generation
+│   └── README.md            # Charting documentation
+│
 ├── tests/               # Test suite
 ├── data/                # Data directory
 └── logs/                # Log files
@@ -163,6 +167,26 @@ results = run_backtest(
 generate_report(results.to_dataframe(), output_dir="./reports")
 ```
 
+## 📊 Visualization
+
+Generate candlestick charts to visually assess stock tradability:
+
+```bash
+# Generate charts for all tickers
+python charting/visualize_prices.py
+
+# Chart specific tickers
+python charting/visualize_prices.py --tickers AAPL_US MSFT_US GOOGL_US
+
+# Filter by date range
+python charting/visualize_prices.py --min-date 2024-01-01 --max-date 2024-12-31
+
+# Limit to top N tickers
+python charting/visualize_prices.py --max-tickers 20
+```
+
+Charts are saved as PNG files in `charting/output/` by default. See [charting/README.md](charting/README.md) for full documentation.
+
 ## 🧪 Testing
 
 ```bash
@@ -286,6 +310,7 @@ MIT License - see LICENSE file for details.
 - [Training Module README](training/README.md)
 - [Evaluation Module README](eval/README.md)
 - [Data Fetch README](data_fetch/README.md)
+- [Charting Module README](charting/README.md)
 
 ## ⚠️ Disclaimer
 

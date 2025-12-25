@@ -195,7 +195,7 @@ class Ingestion:
                 logger.info(f"Loading HDF5 file from {self.hdf5_path}")
                 self._file = h5py.File(str(self.hdf5_path), 'r')
                 self._ticker_names = [name.decode('utf-8') if isinstance(name, bytes) else name 
-                                      for name in self._file['ticker_names'][:]]
+                                    for name in self._file['ticker_names'][:]]
                 self._ticker_boundaries = self._file['ticker_boundaries'][:]
                 logger.debug(f"Loaded HDF5 file with {len(self._ticker_names)} tickers")
             except (OSError, IOError) as e:

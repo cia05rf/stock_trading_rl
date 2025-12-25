@@ -35,6 +35,7 @@ dependencies = [
     "gymnasium>=0.29.0",
     # Visualization
     "matplotlib>=3.9.0",
+    "mplfinance>=0.12.0",
     "tensorboard>=2.18.0",
     "rich>=14.2.0",
 ]

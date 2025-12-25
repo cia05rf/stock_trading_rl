@@ -6,6 +6,8 @@ Usage:
     python convert_to_hdf5.py
     python convert_to_hdf5.py --output custom_path.h5
     python convert_to_hdf5.py --min-avg-volume 100000 --min-avg-value 500000
+    python convert_to_hdf5.py --exchange CC  # Crypto only
+    python convert_to_hdf5.py --asset-type crypto  # Crypto only
 """
 
 import argparse
@@ -26,7 +28,7 @@ def get_csv_files(data_dir: str) -> list[str]:
     return sorted(files)
 
 
-def parse_csv(filepath: str) -> pd.DataFrame:
+def parse_csv(filepath: str, nrows: int = None) -> pd.DataFrame:
     """Parse a single CSV file with proper dtypes."""
     df = pd.read_csv(
         filepath,
@@ -42,8 +44,20 @@ def parse_csv(filepath: str) -> pd.DataFrame:
             'Exchange': str,
         },
         parse_dates=['datetime'],
+        nrows=nrows,
     )
     return df
+
+
+def get_exchange_from_csv(filepath: str) -> str:
+    """Get the exchange code from a CSV file (reads first row only)."""
+    try:
+        df = parse_csv(filepath, nrows=1)
+        if len(df) > 0 and 'Exchange' in df.columns:
+            return str(df['Exchange'].iloc[0])
+    except Exception:
+        pass
+    return None
 
 
 def calculate_liquidity_metrics(df: pd.DataFrame) -> dict:
@@ -96,6 +110,97 @@ def calculate_liquidity_metrics(df: pd.DataFrame) -> dict:
         'avg_price': avg_price,
         'n_rows': len(df),
     }
+
+
+def filter_by_exchange_or_type(
+    ticker_info: dict,
+    exchange: str = None,
+    asset_type: str = None,
+) -> dict:
+    """
+    Filter tickers by exchange code or asset type.
+
+    Args:
+        ticker_info: dict of ticker_key -> info dict
+        exchange: Exchange code to filter by (e.g., "CC", "FOREX", "US")
+        asset_type: Asset type to filter by (e.g., "crypto", "forex", "stock")
+
+    Returns:
+        Filtered ticker_info dict
+    """
+    if not exchange and not asset_type:
+        return ticker_info
+
+    # Map asset types to exchange codes
+    asset_type_to_exchange = {
+        'crypto': 'CC',
+        'forex': 'FOREX',
+        'stock': None,  # Stocks have various exchanges (US, LSE, etc.)
+    }
+
+    # Determine target exchange(s)
+    target_exchanges = set()
+    if exchange:
+        target_exchanges.add(exchange)
+    if asset_type:
+        if asset_type.lower() in asset_type_to_exchange:
+            mapped_exchange = asset_type_to_exchange[asset_type.lower()]
+            if mapped_exchange:
+                target_exchanges.add(mapped_exchange)
+            elif asset_type.lower() == 'stock':
+                # For stocks, we need to check if exchange is NOT CC or FOREX
+                # We'll filter by checking if exchange is not in crypto/forex
+                pass
+
+    filtered = {}
+    rejected_count = 0
+
+    for ticker_key, info in ticker_info.items():
+        filepath = info['filepath']
+        ticker_exchange = get_exchange_from_csv(filepath)
+
+        if ticker_exchange is None:
+            rejected_count += 1
+            continue
+
+        # Filter by specific exchange
+        if exchange:
+            if ticker_exchange != exchange:
+                rejected_count += 1
+                continue
+
+        # Filter by asset type
+        if asset_type:
+            asset_type_lower = asset_type.lower()
+            if asset_type_lower == 'crypto':
+                if ticker_exchange != 'CC':
+                    rejected_count += 1
+                    continue
+            elif asset_type_lower == 'forex':
+                if ticker_exchange != 'FOREX':
+                    rejected_count += 1
+                    continue
+            elif asset_type_lower == 'stock':
+                # Stocks are anything that's not crypto or forex
+                if ticker_exchange in ('CC', 'FOREX'):
+                    rejected_count += 1
+                    continue
+
+        filtered[ticker_key] = info
+
+    # Print filtering summary
+    if rejected_count > 0:
+        filter_desc = []
+        if exchange:
+            filter_desc.append(f"exchange={exchange}")
+        if asset_type:
+            filter_desc.append(f"asset_type={asset_type}")
+        print(f"\nExchange/Type filtering results ({', '.join(filter_desc)}):")
+        print(f"  Original tickers:  {len(ticker_info)}")
+        print(f"  Passed filters:    {len(filtered)}")
+        print(f"  Rejected:          {rejected_count}")
+
+    return filtered
 
 
 def filter_by_liquidity(
@@ -171,6 +276,8 @@ def convert_csvs_to_hdf5(
     min_avg_value: float = 0,
     min_data_points: int = 0,
     min_trading_pct: float = 0,
+    exchange: str = None,
+    asset_type: str = None,
 ) -> dict:
     """
     Convert all CSV files to a single HDF5 file.
@@ -182,6 +289,8 @@ def convert_csvs_to_hdf5(
         min_avg_value: Minimum average traded value for liquidity filter
         min_data_points: Minimum data points required
         min_trading_pct: Minimum trading activity percentage (0-1)
+        exchange: Filter by exchange code (e.g., "CC", "FOREX", "US")
+        asset_type: Filter by asset type (e.g., "crypto", "forex", "stock")
 
     Returns:
         dict with statistics about the conversion
@@ -214,6 +323,18 @@ def convert_csvs_to_hdf5(
         }
 
     print(f"Scanned {len(ticker_info)} tickers")
+
+    # Apply exchange/asset type filters first
+    if exchange or asset_type:
+        ticker_info = filter_by_exchange_or_type(
+            ticker_info,
+            exchange=exchange,
+            asset_type=asset_type,
+        )
+
+    if not ticker_info:
+        raise ValueError(
+            "No tickers passed exchange/asset type filters! Check your filter criteria.")
 
     # Apply liquidity filters
     applying_filters = any([min_avg_volume > 0, min_avg_value > 0,
@@ -319,6 +440,10 @@ def convert_csvs_to_hdf5(
         f.attrs['filter_min_avg_value'] = min_avg_value
         f.attrs['filter_min_data_points'] = min_data_points
         f.attrs['filter_min_trading_pct'] = min_trading_pct
+        if exchange:
+            f.attrs['filter_exchange'] = exchange
+        if asset_type:
+            f.attrs['filter_asset_type'] = asset_type
 
         # Second pass: write data (only filtered tickers)
         current_idx = 0
@@ -442,8 +567,25 @@ def main():
         default=None,
         help='Preset to use for the conversion (default: None)',
     )
+    parser.add_argument(
+        '--exchange',
+        type=str,
+        default=None,
+        help='Filter by exchange code (e.g., CC, FOREX, US, LSE). Mutually exclusive with --asset-type.',
+    )
+    parser.add_argument(
+        '--asset-type',
+        type=str,
+        default=None,
+        choices=['crypto', 'forex', 'stock'],
+        help='Filter by asset type: crypto, forex, or stock. Mutually exclusive with --exchange.',
+    )
 
     args = parser.parse_args()
+
+    # Validate that exchange and asset_type are not both specified
+    if args.exchange and args.asset_type:
+        parser.error("--exchange and --asset-type are mutually exclusive. Use only one.")
 
     # Presets use other arguments if given otherwise use presets
     if args.preset:
@@ -487,6 +629,8 @@ def main():
         min_avg_value=args.min_avg_value,
         min_data_points=args.min_data_points,
         min_trading_pct=args.min_trading_pct,
+        exchange=args.exchange,
+        asset_type=args.asset_type,
     )
 
     print("\n" + "=" * 50)

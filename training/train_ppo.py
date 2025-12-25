@@ -36,7 +36,7 @@ from training.callbacks import (
     EpisodeMetricsCallback,
 )
 from training.curriculum import CurriculumCallback
-from training.lr_schedules import linear_warmup_cosine_decay
+from training.lr_schedules import warmup_exponential_schedule
 
 logger = get_logger(__name__)
 
@@ -209,23 +209,17 @@ def train(
 
     # Network hyperparameters
     hidden_dim = 128
-    sequence_lengths = [8, 32]
-    num_lstm_layers = 1
+    sequence_lengths = [16, 64, 256]
+    num_lstm_layers = 2
 
-    # Learning rate schedule - linear decay from START to END
-    def linear_lr_schedule(progress_remaining: float) -> float:
-        """
-        Linear learning rate schedule.
-        
-        Args:
-            progress_remaining: 1.0 at start, 0.0 at end
-            
-        Returns:
-            Learning rate at current progress
-        """
-        lr_start = config.LEARNING_RATE_START
-        lr_end = config.LEARNING_RATE_END
-        return lr_end + (lr_start - lr_end) * progress_remaining
+    # Learning rate schedule - warmup (start low, go high) then exponential decay
+    lr_schedule = warmup_exponential_schedule(
+        initial_value=config.LR_WARMUP_START,  # Start low
+        peak_value=config.LR_PEAK,  # Go high
+        final_value=config.LEARNING_RATE_END,  # Decay to final
+        warmup_fraction=config.LR_WARMUP_FRACTION,
+        decay_fraction=config.LR_DECAY_FRACTION,
+    )
 
     # Create PPO model with updated hyperparameters
     model = PPO(
@@ -233,7 +227,7 @@ def train(
         env=env,
         verbose=1,
         device=device,
-        learning_rate=linear_lr_schedule,  # Linear decay schedule
+        learning_rate=lr_schedule,  # Warmup then exponential decay schedule
         n_steps=2048,  # Stable gradients
         batch_size=128,  # Stable gradients
         n_epochs=config.EPOCHS,
@@ -243,6 +237,7 @@ def train(
         max_grad_norm=0.5,
         tensorboard_log=str(config.TB_LOG_DIR),
         gamma=0.99,
+        gae_lambda=0.95,
         seed=seed,
         policy_kwargs=dict(
             features_extractor_class=IdentityFeaturesExtractor,
@@ -291,7 +286,13 @@ def train(
     )
     # Custom metrics callback for episode-level metrics
     episode_metrics = EpisodeMetricsCallback(verbose=1)
-    callbacks = [stock_id_updater, info_logger, gradient_monitor, trading_metrics, curriculum, episode_metrics]
+    # Curriculum fee callback to set total training steps for dynamic fee calculation
+    from training.callbacks import CurriculumFeeCallback
+    curriculum_fee = CurriculumFeeCallback(
+        total_timesteps=actual_timesteps,
+        verbose=1
+    )
+    callbacks = [curriculum_fee, stock_id_updater, info_logger, gradient_monitor, trading_metrics, curriculum, episode_metrics]
 
     # Train
     try:

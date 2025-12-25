@@ -20,6 +20,61 @@ from shared.logging_config import get_logger
 logger = get_logger(__name__)
 
 
+class CurriculumFeeCallback(BaseCallback):
+    """
+    Callback to set total training steps in the environment for curriculum learning.
+    
+    This enables the environment to calculate dynamic transaction fees based on
+    training progress (starting at 0.0 and ramping to TARGET_TRANSACTION_FEE).
+    """
+    
+    def __init__(self, total_timesteps: Optional[int] = None, verbose: int = 0):
+        super().__init__(verbose)
+        self.total_timesteps_set = False
+        self.total_timesteps = total_timesteps
+    
+    def _on_training_start(self) -> None:
+        """Set total training steps when training starts."""
+        # We'll set it in _on_step when we have access to locals
+        pass
+    
+    def _on_step(self) -> bool:
+        """Set total training steps on first step if not already set."""
+        if not self.total_timesteps_set:
+            # Try multiple ways to get total_timesteps
+            total_timesteps = self.total_timesteps
+            
+            # Method 1: Use the value passed during initialization
+            if total_timesteps is None:
+                # Method 2: From locals (passed from learn() method)
+                if hasattr(self, 'locals') and self.locals:
+                    total_timesteps = self.locals.get('total_timesteps', None)
+            
+            if total_timesteps is not None:
+                self._set_total_timesteps(total_timesteps)
+        
+        return True
+    
+    def _set_total_timesteps(self, total_timesteps: int) -> None:
+        """Helper method to set total timesteps in environment."""
+        # Get the base environment (unwrap VecEnv if needed)
+        env = self.training_env
+        if hasattr(env, 'envs') and len(env.envs) > 0:
+            # VecEnv - set for all sub-environments
+            for sub_env in env.envs:
+                if hasattr(sub_env, 'set_total_training_steps'):
+                    sub_env.set_total_training_steps(total_timesteps)
+        elif hasattr(env, 'set_total_training_steps'):
+            # Single environment
+            env.set_total_training_steps(total_timesteps)
+        
+        self.total_timesteps_set = True
+        logger.info(
+            f"Set total training steps to {total_timesteps:,} "
+            f"for curriculum learning"
+        )
+
+
 class StockIdUpdateCallback(BaseCallback):
     """
     Callback to update stock_id in the policy from environment info.
