@@ -4,14 +4,16 @@ An optimized async implementation for fetching intraday price data from the EODH
 
 ## Features
 
-- **Async/Await**: Fully asynchronous implementation for concurrent API calls using aiohttp
-- **Rate Limiting**: Sliding window rate limiter to respect API limits
+- **Dual Data Sources**: Support for both yfinance (default) and EODHD API
+- **Async/Await**: Fully asynchronous implementation for concurrent API calls using aiohttp (EODHD)
+- **Rate Limiting**: Sliding window rate limiter to respect API limits (EODHD)
 - **Timeout Handling**: Configurable timeouts with automatic retries and exponential backoff
 - **Incremental Writes**: Batched writes to disk to minimize memory usage
-- **Resume Support**: Automatically resumes from last fetched timestamp
+- **Resume Support**: Automatically resumes from last fetched timestamp in existing CSV files
 - **Robust SSL**: Proper SSL/TLS handling with certifi certificates
 - **Test Mode**: Built-in test mode for development and debugging
 - **Progress Bars**: Visual progress tracking with tqdm
+- **CLI Interface**: Easy command-line switching between data sources
 
 ## Project Structure
 
@@ -22,7 +24,8 @@ intraday-price-fetch/
 │   ├── symbol_lists_st_en.json # Symbols with start/end dates
 │   └── {TICKER}_{EXCHANGE}_{INTERVAL}.csv  # Price data files
 ├── data_fetch/           # Data fetching module
-│   ├── price_scraper.py      # Main script - fetches intraday price data
+│   ├── fetch_prices.py       # Main ingestion script - supports yfinance (default) and EODHD
+│   ├── price_scraper.py      # EODHD API scraper - fetches intraday price data
 │   ├── fetch_symbols.py      # Fetches symbol lists from EODHD API
 │   ├── augment_symbols.py    # Adds start/end dates to symbol lists
 │   ├── convert_to_hdf5.py    # Converts CSVs to a single .h5 (fast training loads)
@@ -49,10 +52,12 @@ intraday-price-fetch/
    uv sync
    ```
 
-2. Create a `.env` file with your EODHD API key:
+2. Create a `.env` file (required only for EODHD API):
    ```
    API_KEY=your_eodhd_api_key_here
    ```
+   
+   **Note**: If you're using yfinance (default), you don't need an API key. The `.env` file is only required when using `--source eodhd`.
 
 ### Optional Dependencies
 
@@ -88,13 +93,54 @@ uv run python augment_symbols.py
 
 This queries the API for each symbol's first and last trading dates, saving to `../data/symbol_lists_st_en.json`. Useful for filtering symbols by data availability.
 
-### Step 3: Run the Price Scraper
+### Step 3: Fetch Price Data
+
+You have two options for fetching price data:
+
+#### Option A: Using yfinance (Recommended for recent data)
+
+```bash
+# Use yfinance (default) - good for data within last 60 days
+uv run python fetch_prices.py
+
+# Or explicitly specify yfinance
+uv run python fetch_prices.py --source yfinance
+```
+
+**yfinance advantages:**
+- Free, no API key required
+- Fast and reliable for recent data
+- Good for regular updates (within 60-day limit for 15m intervals)
+
+**yfinance limitations:**
+- 60-day limit for 15-minute interval data
+- May have rate limiting for large symbol lists
+- Some symbols may not be available
+
+#### Option B: Using EODHD API (For historical data)
+
+```bash
+uv run python fetch_prices.py --source eodhd
+```
+
+**EODHD advantages:**
+- No time limit for historical data
+- More comprehensive symbol coverage
+- Better for initial bulk data collection
+
+**EODHD requirements:**
+- Requires API key in `.env` file
+- Subject to API rate limits and quotas
+
+#### Legacy: Direct EODHD scraper
+
+You can also use the original scraper directly:
 
 ```bash
 uv run python price_scraper.py
 ```
 
-This downloads 15-minute intraday data for all symbols in `../data/symbol_lists.json`.
+This downloads 15-minute intraday data for all symbols in `../data/symbol_lists.json` using the EODHD API.
 
 ## Creating HDF5 datasets (`.h5`) for training / fast loading
 
@@ -166,9 +212,11 @@ uv run python compare_hdf5.py
 
 ### Interval notes (15m vs 1m vs etc.)
 
-Both `price_scraper.py` and `convert_to_hdf5.py` key off `INTERVAL`:
-- The scraper writes files matching `*_{INTERVAL}.csv`
+Both `fetch_prices.py`, `price_scraper.py`, and `convert_to_hdf5.py` key off `INTERVAL`:
+- The scrapers write files matching `*_{INTERVAL}.csv`
 - The converter only reads files matching `*_{INTERVAL}.csv`
+
+**Important**: yfinance has a 60-day limit for 15-minute interval data. For intervals beyond 60 days, use the EODHD source (`--source eodhd`).
 
 To build HDF5s for a different interval, you typically:
 - Set `INTERVAL` (in `.env` or environment variables)
@@ -179,7 +227,13 @@ Example (PowerShell):
 
 ```powershell
 $env:INTERVAL="1m"
-uv run python price_scraper.py
+# Use yfinance for recent data
+uv run python fetch_prices.py
+
+# Or use EODHD for historical data
+uv run python fetch_prices.py --source eodhd
+
+# Convert to HDF5
 uv run python convert_to_hdf5.py --output ../data/prices_all_1m.h5
 ```
 
@@ -187,7 +241,13 @@ Example (bash):
 
 ```bash
 export INTERVAL="1m"
-uv run python price_scraper.py
+# Use yfinance for recent data
+uv run python fetch_prices.py
+
+# Or use EODHD for historical data
+uv run python fetch_prices.py --source eodhd
+
+# Convert to HDF5
 uv run python convert_to_hdf5.py --output ../data/prices_all_1m.h5
 ```
 
@@ -231,7 +291,16 @@ API_KEY=your_eodhd_api_key
 TEST_MODE=false
 ```
 
-### Price Scraper Settings (price_scraper.py)
+### Price Scraper Settings
+
+#### fetch_prices.py (yfinance)
+
+- **No API key required** for yfinance
+- Automatically handles 60-day limit for 15m intervals
+- Includes small delays between requests to avoid rate limiting
+- Uses same configuration as EODHD for date ranges and intervals
+
+#### price_scraper.py (EODHD API)
 
 | Setting | Default | Description |
 |---------|---------|-------------|
@@ -256,13 +325,26 @@ Set `TEST_MODE=true` in your `.env` file to enable test mode:
 Data is saved incrementally to the `../data/` directory:
 - Each symbol gets its own CSV file: `{TICKER}_{EXCHANGE}_{INTERVAL}.csv`
 - Files contain columns: `timestamp`, `gmtoffset`, `datetime`, `open`, `high`, `low`, `close`, `volume`, `Ticker`, `Exchange`
-- Resume support: If a file exists, scraper continues from the last timestamp
+- **Resume support**: Both `fetch_prices.py` and `price_scraper.py` automatically detect existing CSV files and continue from the last timestamp, avoiding duplicate downloads
+- Output format is identical regardless of data source (yfinance or EODHD)
 
 ## Utility Scripts
 
+### Fetch Prices (Main Ingestion)
+
+The main script for fetching price data with support for both yfinance and EODHD:
+
+```bash
+# Use yfinance (default, no API key needed)
+uv run python fetch_prices.py
+
+# Use EODHD API (requires API key)
+uv run python fetch_prices.py --source eodhd
+```
+
 ### Calculate API Usage
 
-Estimate API calls and time needed:
+Estimate API calls and time needed (EODHD only):
 ```bash
 uv run python calculate_api_usage.py
 ```

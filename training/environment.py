@@ -673,6 +673,10 @@ class StockTradingEnv(gym.Env):
     def _take_action(self, target_position: int, current_price: float) -> Tuple[str, bool]:
         """
         Execute action to reach target position with proper fee handling.
+        
+        **NO-OP LOGIC**: If current position already matches target position,
+        return immediately without executing any trade, charging fees, or
+        incrementing trade counters. This prevents unnecessary churn.
 
         Args:
             target_position: 0=Neutral, 1=Long, 2=Short
@@ -682,7 +686,38 @@ class StockTradingEnv(gym.Env):
             Tuple of (action_name, trade_executed)
         """
         current_shares = self.shares_held
-        action_name = "neutral"
+        
+        # Determine current position: -1 (short), 0 (neutral), 1 (long)
+        if current_shares > 0:
+            current_position = 1  # Long
+        elif current_shares < 0:
+            current_position = -1  # Short
+        else:
+            current_position = 0  # Neutral
+        
+        # Map target_position to normalized position: 0=Neutral, 1=Long, 2=Short
+        # Convert to: 0 (neutral), 1 (long), -1 (short)
+        if target_position == 0:
+            target_normalized = 0  # Neutral
+            action_name = "neutral"
+        elif target_position == 1:
+            target_normalized = 1  # Long
+            action_name = "long"
+        elif target_position == 2:
+            target_normalized = -1  # Short
+            action_name = "short"
+        else:
+            # Invalid action, default to neutral
+            target_normalized = 0
+            action_name = "neutral"
+        
+        # **CRITICAL NO-OP CHECK**: If already in target position, do nothing
+        if current_position == target_normalized:
+            # Already in target position - no trade needed
+            # Return immediately without executing trade, charging fee, or incrementing trades_count
+            return action_name, False
+        
+        # Position change required - proceed with trade execution
         trade_executed = False
         
         # Determine current position state
@@ -701,10 +736,7 @@ class StockTradingEnv(gym.Env):
                 self._close_short_position(current_price)
                 action_name = "neutral"
                 trade_executed = True
-            else:
-                # Already neutral
-                action_name = "neutral"
-                trade_executed = False
+            # is_neutral case already handled by NO-OP check above
                 
         elif target_position == 1:  # Long: Go 100% long
             if is_short:
@@ -719,12 +751,7 @@ class StockTradingEnv(gym.Env):
                 self._open_long_position_direct(current_price)
                 action_name = "long"
                 trade_executed = True
-            elif is_long:
-                # Already long, rebalance to max
-                self._close_long_position(current_price)
-                self._open_long_position_direct(current_price)
-                action_name = "long"
-                trade_executed = True
+            # is_long case already handled by NO-OP check above
                 
         elif target_position == 2:  # Short: Go 100% short
             if is_long:
@@ -739,12 +766,7 @@ class StockTradingEnv(gym.Env):
                 self._open_short_position_direct(current_price)
                 action_name = "short"
                 trade_executed = True
-            elif is_short:
-                # Already short, rebalance to max
-                self._close_short_position(current_price)
-                self._open_short_position_direct(current_price)
-                action_name = "short"
-                trade_executed = True
+            # is_short case already handled by NO-OP check above
         
         return action_name, trade_executed
     

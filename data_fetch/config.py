@@ -90,11 +90,11 @@ DAILY_API_LIMIT: int = _config["api"]["daily_limit"]
 # Start date for historical data fetching
 START_DATE: datetime = datetime.strptime(_config["dates"]["start_date"], "%Y-%m-%d")
 
-# End date for historical data (None means current date)
+# End date for historical data (None/null means current date)
 _end_date_str: Optional[str] = _config["dates"]["end_date"]
 END_DATE: datetime = (
     datetime.strptime(_end_date_str, "%Y-%m-%d")
-    if _end_date_str
+    if _end_date_str is not None
     else datetime.now()
 )
 

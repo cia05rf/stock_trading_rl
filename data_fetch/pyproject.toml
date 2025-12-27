@@ -22,6 +22,9 @@ dependencies = [
     "certifi>=2024.0.0",
     # HTTP (sync fallback)
     "requests>=2.31.0",
+    # Financial data
+    "yfinance>=0.2.0",
+    "scipy>=1.16.3",
 ]
 
 [project.optional-dependencies]

@@ -512,7 +512,8 @@ async def main():
             )
         else:
             START = config.START_DATE
-            END = config.END_DATE
+            # Ensure END_DATE is set to now if it's None/null
+            END = config.END_DATE if config.END_DATE is not None else datetime.datetime.now()
         
 
         # Get all symbols to process
