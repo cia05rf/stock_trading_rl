@@ -138,6 +138,12 @@ class MultiScaleActorCriticPolicy(ActorCriticPolicy):
             observation_space, action_space, lr_schedule, *args, **kwargs
         )
         
+        # After super().__init__ calls _build(), we replace action_net and value_net
+        # with nn.Identity because our MultiScaleActorCritic network already handles
+        # the final mapping to action_dim and value_dim (1).
+        self.action_net = torch.nn.Identity()
+        self.value_net = torch.nn.Identity()
+        
         logger.info(f"Initialized MultiScaleActorCriticPolicy with obs_shape={self.obs_shape}, num_stocks={num_stocks}")
 
     def extract_features(self, obs: torch.Tensor) -> torch.Tensor:
@@ -227,23 +233,25 @@ class MultiScaleActorCriticPolicy(ActorCriticPolicy):
 
     def get_distribution(self, obs: torch.Tensor):
         """
-        Override to pass stock_id to mlp_extractor and clamp Gaussian log_std.
+        Override to pass stock_id to mlp_extractor and use network-provided std for continuous actions.
         """
-        if self.is_continuous and hasattr(self, "log_std") and self.log_std is not None:
-            with torch.no_grad():
-                # Typical safe range used in many continuous-control implementations.
-                self.log_std.data = torch.nan_to_num(
-                    self.log_std.data,
-                    nan=-2.0,
-                    posinf=2.0,
-                    neginf=-20.0,
-                )
-                self.log_std.data.clamp_(-20.0, 2.0)
-        
-        features = super().extract_features(obs, self.pi_features_extractor)
+        features = self.extract_features(obs)
         latent_pi = self._call_mlp_extractor_with_stock_id(features, use_actor=True)
         return self._get_action_dist_from_latent(latent_pi)
     
+    def _get_action_dist_from_latent(self, latent_pi: torch.Tensor):
+        """
+        Override to use network-provided std for continuous actions.
+        """
+        mean_actions = self.action_net(latent_pi)
+        if self.is_continuous:
+            # Use state-independent std from network (Softplus ensures positivity)
+            std = self.mlp_extractor.get_action_std()
+            # SB3 DiagGaussianDistribution expects log_std
+            log_std = torch.log(std + 1e-8)
+            return self.action_dist.proba_distribution(mean_actions, log_std)
+        return super()._get_action_dist_from_latent(latent_pi)
+
     def _call_mlp_extractor_with_stock_id(self, features: torch.Tensor, use_actor: bool = False, use_critic: bool = False):
         """
         Call mlp_extractor with stock_id if available.
@@ -344,14 +352,14 @@ class IdentityFeaturesExtractor(BaseFeaturesExtractor):
         self._observation_shape = observation_space.shape
         
         # Infer obs_window_size and n_features from observation space
-        # Default: 9 features per timestep (as per refactor spec)
-        n_features = 9
+        # Default: 10 features per timestep (as per recent refactor)
+        n_features = 10
         if features_dim % n_features == 0:
             self.obs_window_size = features_dim // n_features
             self.n_features = n_features
         else:
             # Try other common feature counts
-            for nf in [8, 10, 7]:
+            for nf in [9, 8, 11, 7]:
                 if features_dim % nf == 0:
                     self.n_features = nf
                     self.obs_window_size = features_dim // nf

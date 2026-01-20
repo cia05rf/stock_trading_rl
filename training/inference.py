@@ -118,7 +118,7 @@ class Infer:
 
     def __init__(self, model_path: Optional[str] = None):
         self.config = get_config()
-        self.window_size = self.config.WINDOW_SIZE
+        self.window_size = self.config.OBS_WINDOW_SIZE  # Use observation window size (e.g. 50)
 
         # Create environment for inference
         self.env = StockTradingEnv(
@@ -127,7 +127,6 @@ class Infer:
             initial_balance=self.config.INITIAL_BALANCE,
             window_size=self.config.WINDOW_SIZE,
             seed=self.config.SEED,
-            action_space_type=self.config.ACTION_SPACE_TYPE,
         )
 
         # Load model
@@ -183,8 +182,11 @@ class Infer:
         # 3. Continuous Mode (Fallback)
         # Handles gym.spaces.Box OR the case where Env is Discrete but Model is Continuous
 
-        # Get the scalar value of the action
-        val = float(np.asarray(action).reshape(-1)[0])
+        # Get all 3 continuous actions
+        actions = np.asarray(action).reshape(-1)
+        signal = float(actions[0])
+        limit_offset_action = float(actions[1]) if len(actions) > 1 else 0.0
+        stop_loss_action = float(actions[2]) if len(actions) > 2 else 0.0
 
         # Calculate Probability Density (Confidence)
         # Normal distributions use log_prob, not probs
@@ -197,22 +199,20 @@ class Infer:
 
         # Domain Logic: Map continuous value to Buy/Sell/Hold
         threshold = self.config.TRADING_THRESHOLD
-        if val > threshold:
+        if signal > threshold:
             action_type = "buy"
-            proportion = float(np.clip(val, 0.0, 1.0))
-        elif val < -threshold:
+        elif signal < -threshold:
             action_type = "sell"
-            proportion = float(np.clip(abs(val), 0.0, 1.0))
         else:
             action_type = "hold"
-            proportion = 0.0
 
         return {
             "action": "continuous",
             "action_type": action_type,
             "action_prob": action_prob,  # Real probability density from the model
-            "action_value": float(val),
-            "proportion": float(proportion),
+            "signal": signal,
+            "limit_offset_action": limit_offset_action,
+            "stop_loss_action": stop_loss_action,
         }
 
     def infer_date(
@@ -313,37 +313,39 @@ class Infer:
         deterministic: bool = False,
     ) -> pd.DataFrame:
         """
-        Generate predictions for all tickers at a specific timestamp using a sliding window.
-        Expects `prices_by_ticker` to be prepared (PricesDf with model_columns) and sorted.
+        Generate predictions for all tickers at a specific timestamp.
+        Uses the environment's observation logic for consistency.
         """
         preds = []
 
         for ticker, df in prices_by_ticker.items():
-            df_up_to = df[df["date"] <= timestamp]
-            if len(df_up_to) == 0:
+            # Find the index for the timestamp
+            # We assume df is sorted by date
+            ts_indices = df.index[df["date"] == timestamp]
+            if ts_indices.empty:
                 continue
-
-            window = df_up_to.tail(self.window_size)
-            obs = window[window.model_columns].values
-            if len(obs) < self.window_size:
-                pad = np.zeros((self.window_size - len(obs), obs.shape[1]))
-                obs = np.vstack((pad, obs))
-
-            obs = np.nan_to_num(obs.astype(np.float32),
-                                nan=0.0, posinf=10.0, neginf=-10.0)
-            obs = np.clip(obs, -10.0, 10.0)
+            
+            idx = ts_indices[0]
+            
+            # Use environment to get observation
+            self.env.df = df
+            self.env.current_step = idx
+            
+            # Update current_stock_id
+            if hasattr(self.env, 'ticker_to_id') and ticker in self.env.ticker_to_id:
+                self.env.current_stock_id = self.env.ticker_to_id[ticker]
+            
+            # Precompute features if needed (usually done in _load_next_df)
+            # Since we're manually setting df, we call it here
+            self.env._precompute_features()
+            
+            obs = self.env._next_observation()
             obs_tensor = torch.tensor(
                 obs, dtype=torch.float32).unsqueeze(0).to(self.device)
 
             # Set stock_id in policy if available
-            stock_id = None
-            if hasattr(self.model.policy, 'set_stock_id'):
-                if hasattr(self.env, 'ticker_to_id') and ticker in self.env.ticker_to_id:
-                    stock_id = self.env.ticker_to_id[ticker]
-                elif hasattr(self.env, 'current_stock_id'):
-                    stock_id = self.env.current_stock_id
-                if stock_id is not None:
-                    self.model.policy.set_stock_id(stock_id)
+            if hasattr(self.model.policy, 'set_stock_id') and hasattr(self.env, 'current_stock_id'):
+                self.model.policy.set_stock_id(self.env.current_stock_id)
 
             action, _ = self.model.predict(obs, deterministic=deterministic)
             decoded = self._decode_action(action, obs_tensor)
@@ -351,7 +353,7 @@ class Infer:
                 "date": timestamp,
                 "ticker": ticker,
                 **decoded,
-                "close": window["close"].iloc[-1] if "close" in window else None,
+                "close": df.iloc[idx]["close"] if "close" in df.columns else None,
             })
 
         return pd.DataFrame(preds)
@@ -373,10 +375,13 @@ class Infer:
             max_date=ts.strftime("%Y-%m-%d"),
         )
         prices = ingest.read_prices(tickers)
+        if prices.empty:
+            return pd.DataFrame()
         prices = prices.sort_values(["ticker", "date"])
 
         prices_by_ticker: Dict[str, PricesDf] = {}
         for t, df_t in prices.groupby("ticker"):
+            # Note: We use the same data loader as the environment for consistency
             prepared = PricesDf(df_t.copy()).prep_data().sort_values("date")
             prices_by_ticker[t] = prepared
 
@@ -395,48 +400,30 @@ class Infer:
     ) -> pd.DataFrame:
         """
         Generate predictions for every step in a single ticker DataFrame.
-
-        Args:
-            data: PricesDf (sorted by date) containing model columns.
-            ticker: Optional ticker label to attach.
-            deterministic: Whether to use deterministic policy.
-
-        Returns:
-            DataFrame of predictions for each step >= window_size-1.
         """
         if len(data) == 0:
             return pd.DataFrame()
 
         preds = []
-        cols = data.model_columns
-        values = data[cols].values
         ticker_label = ticker or (
-            data["ticker"].iloc[0] if "ticker" in data else "")
+            data["ticker"].iloc[0] if "ticker" in data else "unknown")
 
-        for idx in range(self.window_size - 1, len(values)):
-            start = idx - self.window_size + 1
-            window = values[start: idx + 1]
-            obs = window
-            if len(window) < self.window_size:
-                pad = np.zeros(
-                    (self.window_size - len(window), window.shape[1]))
-                obs = np.vstack((pad, window))
+        # Set up environment
+        self.env.df = data
+        self.env._precompute_features()
+        
+        # Update current_stock_id
+        if hasattr(self.env, 'ticker_to_id') and ticker_label in self.env.ticker_to_id:
+            self.env.current_stock_id = self.env.ticker_to_id[ticker_label]
+        
+        if hasattr(self.model.policy, 'set_stock_id') and hasattr(self.env, 'current_stock_id'):
+            self.model.policy.set_stock_id(self.env.current_stock_id)
 
-            obs = np.nan_to_num(obs.astype(np.float32),
-                                nan=0.0, posinf=10.0, neginf=-10.0)
-            obs = np.clip(obs, -10.0, 10.0)
+        for idx in range(len(data)):
+            self.env.current_step = idx
+            obs = self.env._next_observation()
             obs_tensor = torch.tensor(
                 obs, dtype=torch.float32).unsqueeze(0).to(self.device)
-
-            # Set stock_id in policy if available
-            stock_id = None
-            if hasattr(self.model.policy, 'set_stock_id'):
-                if hasattr(self.env, 'ticker_to_id') and ticker_label in self.env.ticker_to_id:
-                    stock_id = self.env.ticker_to_id[ticker_label]
-                elif hasattr(self.env, 'current_stock_id'):
-                    stock_id = self.env.current_stock_id
-                if stock_id is not None:
-                    self.model.policy.set_stock_id(stock_id)
 
             action, _ = self.model.predict(obs, deterministic=deterministic)
             decoded = self._decode_action(action, obs_tensor)
@@ -445,7 +432,7 @@ class Infer:
                 "date": data["date"].iloc[idx],
                 "step": idx,
                 **decoded,
-                "close": data["close"].iloc[idx] if "close" in data else None,
+                "close": data["close"].iloc[idx] if "close" in data.columns else None,
             })
 
         return pd.DataFrame(preds)
@@ -455,15 +442,12 @@ class Infer:
         start: pd.Timestamp,
         end: pd.Timestamp,
         tickers: Optional[List[str]] = None,
-        buffer_days: int = 20,
+        buffer_days: int = 30,
         deterministic: bool = False,
     ) -> pd.DataFrame:
         """
         Generate predictions for all timestamps in a window [start, end].
-
-        Fetches data once, prepares per-ticker windows, and iterates across all
-        timestamps (e.g., intraday bars). Returns a concatenated DataFrame of
-        predictions with one row per ticker per timestamp.
+        Ticker-major implementation for better performance with environment-based observations.
         """
         logger.info(
             f"Predicting for {start} to {end} with tickers {'ALL' if tickers is None else tickers}")
@@ -476,33 +460,35 @@ class Infer:
             max_date=end_ts.strftime("%Y-%m-%d"),
         )
         prices = ingest.read_prices(tickers)
+        if prices.empty:
+            return pd.DataFrame()
+        
         prices = prices.sort_values(["ticker", "date"])
 
-        if len(prices) == 0:
-            return pd.DataFrame()
-
-        # Prepare per-ticker data
-        prices_by_ticker: Dict[str, PricesDf] = {}
-        for ticker, df_t in prices.groupby("ticker"):
-            prepared = PricesDf(df_t.copy()).prep_data().sort_values("date")
-            prices_by_ticker[ticker] = prepared
-
-        # Unique timestamps within [start, end]
-        ts_filtered = prices[(prices["date"] >= start_ts)
-                             & (prices["date"] <= end_ts)]
-        timestamps = sorted(ts_filtered["date"].unique())
-        if not timestamps:
-            return pd.DataFrame()
-
         all_preds = []
-        for ts in tqdm(timestamps, desc="Predicting over time periods"):
-            preds = self.predict_for_timestamp(
-                prices_by_ticker=prices_by_ticker,
-                timestamp=pd.to_datetime(ts),
-                deterministic=deterministic,
+        
+        # Group by ticker for ticker-major processing
+        groups = prices.groupby("ticker")
+        for ticker, df_t in tqdm(groups, desc="Predicting per ticker"):
+            # Prepare data same as environment
+            prepared = PricesDf(df_t.copy()).prep_data().sort_values("date")
+            
+            # Filter for requested timespan
+            df_filtered = prepared[(prepared["date"] >= start_ts) & (prepared["date"] <= end_ts)]
+            if df_filtered.empty:
+                continue
+                
+            # Use predict_over_data for this ticker
+            ticker_preds = self.predict_over_data(
+                data=prepared,
+                ticker=ticker,
+                deterministic=deterministic
             )
-            if not preds.empty:
-                all_preds.append(preds)
+            
+            # Filter predictions to requested timespan
+            ticker_preds = ticker_preds[(ticker_preds["date"] >= start_ts) & (ticker_preds["date"] <= end_ts)]
+            if not ticker_preds.empty:
+                all_preds.append(ticker_preds)
 
         if not all_preds:
             return pd.DataFrame()

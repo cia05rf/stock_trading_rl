@@ -81,15 +81,22 @@ class MultiScaleActorCritic(nn.Module):
 
         # Actor network (now expects combined_dim)
         self.act_fc1 = nn.Linear(combined_dim, actor_hidden_dim)
-        actor_out_dim = 1 if self.continuous_actions else action_dim
-        self.act_fc2 = nn.Linear(actor_hidden_dim, actor_out_dim)
+        if self.continuous_actions:
+            self.actor_out_dim = 3
+            self.act_fc2 = nn.Linear(actor_hidden_dim, self.actor_out_dim)
+            # Separate state-independent learnable parameter for log_std
+            # We'll use a parameter that will be passed through softplus to ensure positivity
+            self.log_std_logits = nn.Parameter(torch.zeros(self.actor_out_dim))
+        else:
+            self.actor_out_dim = action_dim
+            self.act_fc2 = nn.Linear(actor_hidden_dim, self.actor_out_dim)
         
         # Critic network (now expects combined_dim)
         self.crit_fc1 = nn.Linear(combined_dim, critic_hidden_dim // 2)
         self.crit_fc2 = nn.Linear(critic_hidden_dim // 2, 1)
 
         # Expected dimensions for Stable-Baselines3 compatibility
-        self.latent_dim_pi = actor_out_dim
+        self.latent_dim_pi = self.actor_out_dim
         self.latent_dim_vf = 1
         
         # Initialize weights
@@ -172,16 +179,29 @@ class MultiScaleActorCritic(nn.Module):
             stock_id: Optional stock ID tensor
         
         Returns:
-            Action probabilities (with epsilon for numerical stability)
+            Action mean (continuous) or probabilities (discrete)
         """
         x = self._extract_features(state, stock_id)
         x = F.relu(self.act_fc1(x))
         if self.continuous_actions:
+            # Output shape (batch, 3) with values strictly between -1 and 1
             x = torch.tanh(self.act_fc2(x))
         else:
             # Add small epsilon to prevent log(0) which causes NaN gradients
             x = F.softmax(self.act_fc2(x), dim=1) + 1e-8
         return x
+
+    def get_action_std(self) -> torch.Tensor:
+        """
+        Get the standard deviation for continuous actions.
+        Ensures positivity using Softplus as requested.
+        
+        Returns:
+            Positive standard deviation tensor of shape (3,)
+        """
+        if not self.continuous_actions:
+            raise ValueError("Standard deviation only available for continuous actions")
+        return F.softplus(self.log_std_logits)
 
     def forward_critic(self, state: torch.Tensor, stock_id: Optional[torch.Tensor] = None) -> torch.Tensor:
         """

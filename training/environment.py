@@ -60,7 +60,6 @@ class StockTradingEnv(gym.Env):
         seed: Optional[int] = None,
         ticker_limit: Optional[int] = None,
         min_date: str = "2018-01-01",
-        action_space_type: str = "discrete",
     ) -> None:
         """
         Initialize the stock trading environment.
@@ -87,7 +86,7 @@ class StockTradingEnv(gym.Env):
         super().__init__()
         
         logger.info("\n" + "=" * 50)
-        logger.info("INITIALIZING STOCK TRADING ENVIRONMENT")
+        logger.info("INITIALIZING STOCK TRADING ENVIRONMENT (LIMIT ORDER STYLE)")
         logger.info("=" * 50)
 
         # Initialize data ingestion
@@ -98,18 +97,11 @@ class StockTradingEnv(gym.Env):
         self.done = False
         self.current_step = 0
         self.mode = mode
-        # Note: Refactored to always use Discrete(3) action space
-        # action_space_type parameter is kept for backward compatibility but ignored
-        if action_space_type and str(action_space_type).strip().lower() == "continuous":
-            logger.warning(
-                "Continuous action space is no longer supported. "
-                "Using Discrete(3) action space (Hold/Buy/Sell)."
-            )
+        
         self.initial_balance = initial_balance
         self.window_size = window_size
         self.obs_window_size = self.config.OBS_WINDOW_SIZE
         # Dynamic transaction fee for curriculum learning
-        # Will be calculated based on training progress
         self.total_training_steps = None  # Set via set_total_training_steps()
         self.global_step_count = 0  # Track total steps across all episodes
         self.transaction_cost_pct = self.config.TRANSACTION_FEE  # Starting fee (0.0)
@@ -125,6 +117,9 @@ class StockTradingEnv(gym.Env):
         self.recent_net_worths: deque = deque(maxlen=50)
         self.recent_run_mean_return: float = 0.0
         
+        # Limit Order Parameters (can be updated by curriculum)
+        self.max_limit_offset = self.config.MAX_LIMIT_OFFSET
+        
         # Progress tracking
         self.progress_bar = tqdm(position=0, leave=True, desc="Processing tickers")
         
@@ -139,27 +134,27 @@ class StockTradingEnv(gym.Env):
         self.prev_shares = 0
         self.prev_price = None
 
+        # Limit Order State
+        self.pending_order = None  # {"type": "buy"/"sell", "price": float, "ttl": int}
+        self.active_position = None  # {"type": "long"/"short", "entry_price": float, "size": float, "stop_loss": float}
+
         # Load all tickers
         tickers = self.ingestion.read_tickers()
         if ticker_limit:
             tickers = tickers.iloc[:ticker_limit]
 
-        # Apply tradability filter: remove low-volatility stocks
+        # Apply tradability filter
         tickers = self._filter_by_tradability(tickers)
         
-        # Create ticker-to-id mapping with sequential IDs (0 to num_stocks-1)
-        # This ensures stock_id values are always in valid range for embedding layer
         unique_tickers = tickers["ticker"].unique()
         self.ticker_to_id = {ticker: idx for idx, ticker in enumerate(unique_tickers)}
         self.num_stocks = len(self.ticker_to_id)
-        self.current_stock_id = 0  # Will be updated when loading tickers
+        self.current_stock_id = 0
 
         train_tickers_df = tickers.sample(frac=test_train_split, random_state=seed)
         self.tickers_train = train_tickers_df["ticker"].to_list()
         self.tickers_test = tickers.drop(train_tickers_df.index)["ticker"].to_list()
 
-        # Initialize random number generator for episode randomization
-        # This will be properly seeded in reset(), but we initialize it here
         self.np_random = None
 
         # Initialize values and set mode
@@ -169,20 +164,20 @@ class StockTradingEnv(gym.Env):
 
         assert len(self.tickers) > 0, "No tickers found"
 
-        # New action space: Discrete(3) - Target Positions
-        # Action 0 (Neutral): Close any open position and go to 100% Cash
-        # Action 1 (Long): Close Short (if any) and go 100% Long (max shares possible)
-        # Action 2 (Short): Close Long (if any) and go 100% Short (max shares possible)
-        self.action_space = spaces.Discrete(3)
+        # Action Space: shape=(3,)
+        # Action[0] (Signal): > 0.3 is BUY, < -0.3 is SELL, between is HOLD/CANCEL.
+        # Action[1] (Limit Offset): Determines the entry price relative to current Close.
+        # Action[2] (Stop Loss): Determines the stop loss relative to the Limit Price.
+        self.action_space = spaces.Box(low=-1, high=1, shape=(3,), dtype=np.float32)
         
         # Track invalid actions for reward calculation
         self.is_invalid_action = False
         
         # Define observation space
-        # Features per timestep: log_return, volume_change, volatility (ATR/Price), 
-        # RSI (scaled), MACD (normalized), time_sin, time_cos, position_ratio, unrealized_pnl_pct
-        # Total: 9 features per timestep
-        n_features_per_step = 9
+        # Features per timestep: log_return, volume_change, volatility, RSI, MACD, time_sin, time_cos, 
+        # Has_Pending_Order (0/1), Has_Active_Position (0/1), Current_Unrealized_PnL
+        # Total: 10 features per timestep
+        n_features_per_step = 10
         obs_shape = (self.obs_window_size * n_features_per_step,)
         self.observation_space = spaces.Box(
             low=-np.inf,
@@ -412,10 +407,13 @@ class StockTradingEnv(gym.Env):
         # 2. Pre-compute Volume Change: Log change of volume
         prev_volumes = np.roll(volumes, 1)
         prev_volumes[0] = volumes[0] if len(volumes) > 0 else 1.0
-        volume_ratios = np.where(
-            (volumes > 0) & (prev_volumes > 0),
-            volumes / prev_volumes,
-            1.0
+        
+        # Use np.divide with 'where' to avoid RuntimeWarning: divide by zero
+        volume_ratios = np.divide(
+            volumes, 
+            prev_volumes, 
+            out=np.ones_like(volumes), 
+            where=(volumes > 0) & (prev_volumes > 0)
         )
         self.volume_changes = np.log(volume_ratios).astype(np.float32)
         self.volume_changes[0] = 0.0
@@ -485,7 +483,7 @@ class StockTradingEnv(gym.Env):
         Only account state is computed on-the-fly as it changes with actions.
 
         Returns:
-            Flattened observation array of shape (obs_window_size * 9,)
+            Flattened observation array of shape (obs_window_size * 10,)
         """
         # Ensure features are pre-computed
         if not hasattr(self, 'log_returns') or len(self.log_returns) == 0:
@@ -498,50 +496,19 @@ class StockTradingEnv(gym.Env):
         # Get current price for account state calculation
         current_price = self.prices_array[self.current_step] if self.current_step < len(self.prices_array) else 0.0
         
-        # Calculate account state (only dynamic feature)
-        # Position_Ratio: Normalized to -1.0 (short) to +1.0 (long), 0.0 (neutral)
-        if self.shares_held > 0:
-            position_ratio = 1.0  # Long
-        elif self.shares_held < 0:
-            position_ratio = -1.0  # Short
-        else:
-            position_ratio = 0.0  # Neutral
+        # Calculate account state (dynamic features)
+        has_pending = 1.0 if self.pending_order is not None else 0.0
+        has_active = 1.0 if self.active_position is not None else 0.0
         
-        # Unrealized_PnL_Pct: (current_value - cost_basis) / cost_basis
-        # Handles both long and short positions
-        if self.shares_held != 0 and hasattr(self, 'holdings') and self.holdings:
-            if self.shares_held > 0:
-                # Long position: calculate PnL from cost basis
-                total_cost = sum(h[0] * h[2] for h in self.holdings if h[2] > 0)
-                total_shares = sum(h[2] for h in self.holdings if h[2] > 0)
-                if total_shares > 0:
-                    avg_cost = total_cost / total_shares
-                    current_value = self.shares_held * current_price
-                    cost_basis = self.shares_held * avg_cost
-                    unrealized_pnl_pct = (
-                        (current_value - cost_basis) / cost_basis
-                        if cost_basis > 0 else 0.0
-                    )
-                else:
-                    unrealized_pnl_pct = 0.0
-            else:
-                # Short position: PnL is inverse (profit when price drops)
-                short_shares = abs(self.shares_held)
-                if self.holdings and len(self.holdings) > 0:
-                    short_entry_price = self.holdings[0][0]  # Entry price
-                    # PnL for short: (entry_value - current_liability) / entry_value
-                    entry_value = short_shares * short_entry_price
-                    current_liability = short_shares * current_price
-                    if entry_value > 0:
-                        unrealized_pnl_pct = (
-                            (entry_value - current_liability) / entry_value
-                        )
-                    else:
-                        unrealized_pnl_pct = 0.0
-                else:
-                    unrealized_pnl_pct = 0.0
-        else:
-            unrealized_pnl_pct = 0.0
+        # Current_Unrealized_PnL: (current_price - entry_price) / entry_price for long
+        # (entry_price - current_price) / entry_price for short
+        unrealized_pnl = 0.0
+        if self.active_position:
+            entry_price = self.active_position["entry_price"]
+            if self.active_position["type"] == "long":
+                unrealized_pnl = (current_price - entry_price) / entry_price if entry_price > 0 else 0.0
+            else:  # short
+                unrealized_pnl = (entry_price - current_price) / entry_price if entry_price > 0 else 0.0
         
         # Build observation window using pre-computed arrays (vectorized)
         window_size = end - start
@@ -588,10 +555,11 @@ class StockTradingEnv(gym.Env):
             time_cos_window = self.time_cos[start:end]
         
         # Create account state arrays (same value for all timesteps in window)
-        position_ratio_window = np.full(self.obs_window_size, position_ratio, dtype=np.float32)
-        unrealized_pnl_pct_window = np.full(self.obs_window_size, unrealized_pnl_pct, dtype=np.float32)
+        has_pending_window = np.full(self.obs_window_size, has_pending, dtype=np.float32)
+        has_active_window = np.full(self.obs_window_size, has_active, dtype=np.float32)
+        unrealized_pnl_window = np.full(self.obs_window_size, unrealized_pnl, dtype=np.float32)
         
-        # Stack all features: shape (obs_window_size, 9)
+        # Stack all features: shape (obs_window_size, 10)
         obs_window = np.column_stack([
             log_returns_window,
             volume_changes_window,
@@ -600,11 +568,12 @@ class StockTradingEnv(gym.Env):
             macd_normalized_window,
             time_sin_window,
             time_cos_window,
-            position_ratio_window,
-            unrealized_pnl_pct_window,
+            has_pending_window,
+            has_active_window,
+            unrealized_pnl_window,
         ])
         
-        # Flatten to 1D: (obs_window_size * 9,)
+        # Flatten to 1D: (obs_window_size * 10,)
         obs = obs_window.flatten()
         
         # Handle NaNs and Infs (vectorized)
@@ -616,539 +585,292 @@ class StockTradingEnv(gym.Env):
         
         return obs.astype(np.float32)
 
-    def calculate_reward(self) -> float:
-        """
-        Calculate reward using Logarithmic Wealth Growth strategy with Conditional Cash Decay.
-
-        Formula: 
-        1. Log Return: log((current_val + eps) / (prev_val + eps)) * 100
-        2. Conditional Cash Decay: CASH_DECAY * cash_ratio (only penalizes cash portion)
-        3. Invalid Action Penalty: if applicable
+    def _liquidate_position(self, current_price: float, reason: str = "stop_loss") -> Tuple[float, float]:
+        """Liquidate active position and return (cash_pnl, pct_pnl)."""
+        if not self.active_position:
+            return 0.0, 0.0
         
-        The cash decay is proportional to cash holdings:
-        - 100% Cash -> Full decay penalty
-        - 0% Cash (fully invested) -> No decay penalty
-        This incentivizes the agent to invest rather than hold cash.
-
-        Returns:
-            Reward value based on logarithmic portfolio growth with conditional decay
-        """
-        # Calculate Portfolio Value (Cash + Stock_Value)
-        current_val = self.balance + (
-            self.shares_held * self.current_price 
-            if hasattr(self, 'current_price') and self.current_price is not None 
-            else 0
-        )
-        prev_val = self.prev_balance + (
-            self.prev_shares * self.prev_price 
-            if self.prev_price is not None and self.prev_price > 0 
-            else 0
-        )
+        entry_price = self.active_position["entry_price"]
+        size = self.active_position["size"]
+        pos_type = self.active_position["type"]
         
-        # 1. Log Return (Compound Growth)
-        # Add epsilon to avoid log(0)
-        reward = np.log((current_val + 1e-8) / (prev_val + 1e-8)) * 100
-        
-        # 2. Conditional Cash Decay (The "Tax on Idle Money")
-        # Only punish the portion of the portfolio sitting in cash.
-        # If CASH_DECAY is -0.001:
-        # - 100% Cash -> -0.001 penalty
-        # - 50% Cash -> -0.0005 penalty
-        # - 0% Cash (fully invested) -> 0.0 penalty
-        if current_val > 0:
-            cash_ratio = self.balance / current_val
-            reward += self.config.CASH_DECAY * cash_ratio
-        
-        # 3. Invalid Action Penalty
-        if self.is_invalid_action:
-            reward -= self.config.INVALID_ACTION_PENALTY
-
-        # Validate and handle edge cases
-        if np.isnan(reward) or np.isinf(reward):
-            logger.warning(f"Invalid reward: {reward}. Setting to 0.")
-            reward = 0.0
-
-        return float(reward)
-
-    def _take_action(self, target_position: int, current_price: float) -> Tuple[str, bool]:
-        """
-        Execute action to reach target position with proper fee handling.
-        
-        **NO-OP LOGIC**: If current position already matches target position,
-        return immediately without executing any trade, charging fees, or
-        incrementing trade counters. This prevents unnecessary churn.
-
-        Args:
-            target_position: 0=Neutral, 1=Long, 2=Short
-            current_price: Current market price
-
-        Returns:
-            Tuple of (action_name, trade_executed)
-        """
-        current_shares = self.shares_held
-        
-        # Determine current position: -1 (short), 0 (neutral), 1 (long)
-        if current_shares > 0:
-            current_position = 1  # Long
-        elif current_shares < 0:
-            current_position = -1  # Short
-        else:
-            current_position = 0  # Neutral
-        
-        # Map target_position to normalized position: 0=Neutral, 1=Long, 2=Short
-        # Convert to: 0 (neutral), 1 (long), -1 (short)
-        if target_position == 0:
-            target_normalized = 0  # Neutral
-            action_name = "neutral"
-        elif target_position == 1:
-            target_normalized = 1  # Long
-            action_name = "long"
-        elif target_position == 2:
-            target_normalized = -1  # Short
-            action_name = "short"
-        else:
-            # Invalid action, default to neutral
-            target_normalized = 0
-            action_name = "neutral"
-        
-        # **CRITICAL NO-OP CHECK**: If already in target position, do nothing
-        if current_position == target_normalized:
-            # Already in target position - no trade needed
-            # Return immediately without executing trade, charging fee, or incrementing trades_count
-            return action_name, False
-        
-        # Position change required - proceed with trade execution
-        trade_executed = False
-        
-        # Determine current position state
-        is_long = current_shares > 0
-        is_short = current_shares < 0
-        is_neutral = current_shares == 0
-        
-        if target_position == 0:  # Neutral: Close any position
-            if is_long:
-                # Close long position (pay fee once)
-                self._close_long_position(current_price)
-                action_name = "neutral"
-                trade_executed = True
-            elif is_short:
-                # Close short position (pay fee once)
-                self._close_short_position(current_price)
-                action_name = "neutral"
-                trade_executed = True
-            # is_neutral case already handled by NO-OP check above
-                
-        elif target_position == 1:  # Long: Go 100% long
-            if is_short:
-                # Short -> Long: Close short + Open long (2x fee)
-                self._close_short_position(current_price)
-                # Now open long (won't close anything since we're neutral)
-                self._open_long_position_direct(current_price)
-                action_name = "long"
-                trade_executed = True
-            elif is_neutral:
-                # Neutral -> Long: Open long (1x fee)
-                self._open_long_position_direct(current_price)
-                action_name = "long"
-                trade_executed = True
-            # is_long case already handled by NO-OP check above
-                
-        elif target_position == 2:  # Short: Go 100% short
-            if is_long:
-                # Long -> Short: Close long + Open short (2x fee)
-                self._close_long_position(current_price)
-                # Now open short (won't close anything since we're neutral)
-                self._open_short_position_direct(current_price)
-                action_name = "short"
-                trade_executed = True
-            elif is_neutral:
-                # Neutral -> Short: Open short (1x fee)
-                self._open_short_position_direct(current_price)
-                action_name = "short"
-                trade_executed = True
-            # is_short case already handled by NO-OP check above
-        
-        return action_name, trade_executed
-    
-    def _close_long_position(self, current_price: float) -> None:
-        """Close all long positions (sell all positive shares)."""
-        if self.shares_held > 0:
-            # Sell all shares
-            shares_to_sell = self.shares_held
-            shares_value = shares_to_sell * current_price
-            # Apply transaction fee (dynamic)
-            current_fee = self._get_current_transaction_fee()
-            sale_val = shares_value * (1 - current_fee)
-            self.balance += sale_val
-            self.shares_held = 0
-            self.holdings = []  # Clear holdings tracking
-    
-    def _close_short_position(self, current_price: float) -> None:
-        """Close all short positions (buy back negative shares)."""
-        if self.shares_held < 0:
-            # Buy back shorted shares
-            shares_to_buy = abs(self.shares_held)
-            current_fee = self._get_current_transaction_fee()
-            cost_per_share = current_price * (1 + current_fee)
-            cost = shares_to_buy * cost_per_share
-            self.balance -= cost
-            self.shares_held = 0
-            self.holdings = []  # Clear holdings tracking
-    
-    def _open_long_position(self, current_price: float) -> None:
-        """Open maximum long position (closes shorts first if needed)."""
-        # Close any existing short position if present
-        if self.shares_held < 0:
-            self._close_short_position(current_price)
-        self._open_long_position_direct(current_price)
-    
-    def _open_long_position_direct(self, current_price: float) -> None:
-        """Open maximum long position (assumes neutral position)."""
-        if current_price <= 0:
-            return
-        
-        # Calculate max shares we can buy with current net worth
-        net_worth = self.balance + (self.shares_held * current_price if self.shares_held != 0 else 0)
         current_fee = self._get_current_transaction_fee()
-        cost_per_share = current_price * (1 + current_fee)
-        max_shares = int(net_worth / cost_per_share)
         
-        if max_shares > 0:
-            cost = max_shares * cost_per_share
-            self.balance -= cost
-            self.shares_held = max_shares
-            # Update holdings tracking
-            self.holdings = [(current_price, current_price, max_shares, max_shares)]
-    
-    def _open_short_position(self, current_price: float) -> None:
-        """Open maximum short position (closes longs first if needed)."""
-        # Close any existing long position if present
-        if self.shares_held > 0:
-            self._close_long_position(current_price)
-        self._open_short_position_direct(current_price)
-    
-    def _open_short_position_direct(self, current_price: float) -> None:
-        """Open maximum short position (assumes neutral position)."""
-        if current_price <= 0:
-            return
-        
-        # Calculate max shares we can short based on net worth
-        # For shorting: we can short shares worth up to net worth (with margin consideration)
-        net_worth = self.balance + (self.shares_held * current_price if self.shares_held != 0 else 0)
-        # Account for transaction fee: can short shares worth (net_worth * (1 - fee))
-        current_fee = self._get_current_transaction_fee()
-        shares_value_limit = net_worth * (1 - current_fee)
-        max_shares_to_short = int(shares_value_limit / current_price)
-        
-        if max_shares_to_short > 0:
-            # Short selling: we receive proceeds minus fee
-            # When shorting: sell shares we don't own, receive cash (minus fee)
-            proceeds = max_shares_to_short * current_price * (1 - current_fee)
-            self.balance += proceeds
-            self.shares_held = -max_shares_to_short  # Negative for short
-            # Track short position (entry price, shares are negative)
-            self.holdings = [(current_price, current_price, -max_shares_to_short, -max_shares_to_short)]
-    
-    def set_total_training_steps(self, total_steps: int) -> None:
-        """
-        Set the total number of training steps for curriculum learning.
-        
-        Args:
-            total_steps: Total number of training timesteps
-        """
-        self.total_training_steps = total_steps
-        logger.info(f"Set total training steps to {total_steps:,} for curriculum learning")
-    
-    def _get_current_transaction_fee(self) -> float:
-        """
-        Calculate current transaction fee based on training progress.
-        
-        Curriculum Learning Strategy:
-        - First 10% of training: 0.0 fee (safe space to learn patterns)
-        - After 10%: Linear ramp from 0.0 to TARGET_TRANSACTION_FEE
-        
-        Returns:
-            Current transaction fee (0.0 to TARGET_TRANSACTION_FEE)
-        """
-        # If total_training_steps not set, use starting fee
-        if self.total_training_steps is None or self.total_training_steps == 0:
-            return self.config.TRANSACTION_FEE
-        
-        # Calculate progress (0.0 to 1.0)
-        progress = min(self.global_step_count / self.total_training_steps, 1.0)
-        
-        # First 10% of training: force fee to 0.0 (safe space)
-        if progress < 0.1:
-            return 0.0
-        
-        # After 10%: Linear ramp from 0.0 to TARGET_TRANSACTION_FEE
-        # Adjust progress to start from 0.1 (so progress 0.1 -> 0.0, progress 1.0 -> 1.0)
-        adjusted_progress = (progress - 0.1) / 0.9  # Maps [0.1, 1.0] to [0.0, 1.0]
-        current_fee = self.config.TARGET_TRANSACTION_FEE * adjusted_progress
-        
-        return float(current_fee)
+        if pos_type == "long":
+            # Sell long position
+            exit_value = size * current_price * (1 - current_fee)
+            cash_pnl = exit_value - (size * entry_price)
+            pct_pnl = (current_price * (1 - current_fee) - entry_price) / entry_price
+            self.balance += exit_value
+        else:
+            # Buy back short position
+            exit_cost = size * current_price * (1 + current_fee)
+            entry_proceeds = size * entry_price # Already in balance from shorting
+            cash_pnl = entry_proceeds - exit_cost
+            pct_pnl = (entry_price - current_price * (1 + current_fee)) / entry_price
+            self.balance -= exit_cost # Subtract the cost to buy back
+            
+        self.active_position = None
+        self.shares_held = 0
+        return cash_pnl, pct_pnl
 
-    def step(self, action) -> Tuple[np.ndarray, float, bool, bool, Dict]:
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict]:
         """
         Execute an action and return the result.
         
-        Action space: Discrete(3) - Target Positions
-        - 0 (Neutral): Close any position and go to 100% Cash
-        - 1 (Long): Close Short (if any) and go 100% Long
-        - 2 (Short): Close Long (if any) and go 100% Short
-
-        Args:
-            action: Action index (0=Neutral, 1=Long, 2=Short)
+        Action space: Box(low=-1, high=1, shape=(3,))
+        - Action[0]: Signal Strength
+        - Action[1]: Limit Offset (Agressiveness)
+        - Action[2]: Stop Loss Offset (Entry only)
 
         Returns:
             Tuple of (observation, reward, done, truncated, info)
         """
-        current_price = self.df.iloc[self.current_step]["raw_close"]
-        self.current_price = current_price  # Store for reward calculation
+        # 1. Get current market data
+        current_candle = self.df.iloc[self.current_step]
+        close_price = current_candle["raw_close"]
+        high_price = current_candle["high"]
+        low_price = current_candle["low"]
         
-        # Store previous state for reward calculation
+        self.current_price = close_price
         self.prev_balance = self.balance
         self.prev_shares = self.shares_held
-        self.prev_price = current_price
+        self.prev_price = close_price
+        self.previous_net_worth = self.net_worth
         
-        # Track invalid action
         self.is_invalid_action = False
+        fill_event = False
+        execution_type = None
+        cash_pnl = 0.0
+        realized_pnl_pct = 0.0
         
-        # Execute action based on target position
-        action_idx = int(action)
-        if action_idx not in [0, 1, 2]:
-            logger.warning(f"Invalid action index: {action_idx}. Defaulting to neutral.")
-            action_idx = 0
+        # --- PHASE A: Order Check (Using Current Candle) ---
         
-        action_name, trade_executed = self._take_action(action_idx, current_price)
+        # A1. Check Active Position for Stop Loss (Pessimistic: SL hits first)
+        if self.active_position:
+            pos = self.active_position
+            if low_price <= pos["stop_loss"]:
+                # Stop Loss hit
+                exit_price = min(pos["stop_loss"], high_price) 
+                cash_pnl, realized_pnl_pct = self._liquidate_position(
+                    exit_price, reason="stop_loss"
+                )
+                execution_type = "stop_loss"
         
-        # Update global step count for curriculum learning
-        self.global_step_count += 1
+        # A2. Check Pending Order for Fill (Only if no position or pending exit)
+        if self.pending_order:
+            order = self.pending_order
+            fill_price = order["price"]
+            filled = False
+            
+            if order["type"] == "buy" and not self.active_position:
+                if low_price < fill_price * 0.9995:
+                    filled = True
+                    # Fill at the limit price (or better if open was below)
+                    fill_price = min(fill_price, high_price)
+            elif order["type"] == "sell" and self.active_position:
+                if high_price >= fill_price:
+                    filled = True
+                    # Fill at the limit price (or better if open was above)
+                    fill_price = max(fill_price, low_price)
+                    
+            if filled:
+                current_fee = self._get_current_transaction_fee()
+                if order["type"] == "buy":
+                    # Calculate size based on balance
+                    cost_per_share = fill_price * (1 + current_fee)
+                    size = int(self.balance / cost_per_share)
+                    if size > 0:
+                        self.balance -= size * cost_per_share
+                        self.active_position = {
+                            "entry_price": fill_price,
+                            "size": size,
+                            "stop_loss": order["stop_loss"],
+                            "type": "long"  # Only long supported in Sniper mode
+                        }
+                        self.shares_held = size
+                        fill_event = True
+                        self.orders_filled += 1
+                        execution_type = "limit_fill_buy"
+                else:  # sell fill
+                    cash_pnl, realized_pnl_pct = self._liquidate_position(
+                        fill_price, reason="limit_fill_sell"
+                    )
+                    fill_event = True
+                    self.orders_filled += 1
+                    execution_type = "limit_fill_sell"
+                
+                self.pending_order = None  # Order filled
         
-        # Calculate current transaction fee (for logging)
-        current_fee = self._get_current_transaction_fee()
-
-        # Update net worth (handles both long and short positions)
-        # For shorts: shares_held is negative, so holdings_value is negative
-        self.holdings_value = self.shares_held * current_price
+        # A3. TTL Check for remaining pending order
+        if self.pending_order:
+            self.pending_order["ttl"] -= 1
+            if self.pending_order["ttl"] <= 0:
+                self.pending_order = None
+                if not execution_type:
+                    execution_type = "ttl_expiry"
+        
+        # --- PHASE B: New Action Processing ---
+        
+        signal = action[0]
+        if not self.active_position:
+            # If No Position: > 0.3 = Place BUY LIMIT
+            if signal > 0.3:
+                limit_price = self._calculate_limit_price(close_price, action[1], order_type="buy")
+                stop_loss = self._calculate_stop_price(limit_price, action[2])
+                self.pending_order = {
+                    "type": "buy",
+                    "price": limit_price,
+                    "stop_loss": stop_loss,
+                    "ttl": self.config.ORDER_TTL
+                }
+                self.orders_placed += 1
+                entry_discount = (close_price - limit_price) / close_price if close_price > 0 else 0
+                self.total_entry_discount += entry_discount
+                execution_type = "new_pending_buy" if not execution_type else execution_type
+            else:
+                # Cancel any pending buy if signal turns neutral/sell
+                self.pending_order = None
+        else:
+            # If Active Position: < -0.3 = Place SELL LIMIT (Exit)
+            if signal < -0.3:
+                limit_price = self._calculate_limit_price(close_price, action[1], order_type="sell")
+                self.pending_order = {
+                    "type": "sell",
+                    "price": limit_price,
+                    "ttl": self.config.ORDER_TTL
+                }
+                self.orders_placed += 1
+                # For sell, "discount" is how much above close we are selling
+                entry_discount = (limit_price - close_price) / close_price if close_price > 0 else 0
+                self.total_entry_discount += entry_discount
+                execution_type = "new_pending_sell" if not execution_type else execution_type
+            elif signal > -0.3:
+                # Cancel pending Sell orders (Hold strategy)
+                if self.pending_order and self.pending_order["type"] == "sell":
+                    self.pending_order = None
+                    execution_type = "cancel_pending_sell" if not execution_type else execution_type
+        
+        # Update Net Worth
+        if self.active_position:
+            self.holdings_value = self.shares_held * close_price
+        else:
+            self.holdings_value = 0
+            
         self.net_worth = self.balance + self.holdings_value
         
-        # Bankruptcy "Kill Switch": Shorting has infinite risk
-        if self.net_worth <= 0:
-            logger.warning(
-                f"Bankruptcy detected! Net worth: {self.net_worth:.2f}, "
-                f"Shares: {self.shares_held}, Balance: {self.balance:.2f}"
-            )
-            reward = -100.0  # Heavy punishment
-            self.done = True
-            return self._next_observation(), reward, self.done, False, {
-                "bankruptcy": True,
-                "net_worth": self.net_worth,
-            }
+        # Update training step count
+        self.global_step_count += 1
         
-        if np.isnan(self.net_worth) or np.isinf(self.net_worth):
-            logger.error("Net worth became NaN or Inf!")
+        # Check for bankruptcy
+        if self.net_worth <= 0:
+            logger.warning(f"Bankruptcy! Net worth: {self.net_worth:.2f}")
             self.done = True
-            return self._next_observation(), 0.0, self.done, False, {}
+            return self._next_observation(), -100.0, self.done, False, {"bankruptcy": True}
 
-        self.max_net_worth = max(self.max_net_worth, self.net_worth)
+        # Calculate reward
+        reward = self.calculate_reward(fill_event, realized_pnl_pct)
+        self.cum_reward += reward
+        
+        # Track history
         self.net_worth_history.append(self.net_worth)
-
-        # Calculate returns
+        self.max_net_worth = max(self.max_net_worth, self.net_worth)
         profit_loss = self.net_worth - self.previous_net_worth
         self.returns.append(profit_loss)
-
-        # Calculate reward using logarithmic wealth growth
-        reward = self.calculate_reward()
-        self.cum_reward += reward
-
-        # Update previous values for next step
         self.previous_net_worth = self.net_worth
-        self.previous_price = current_price
 
-        # Build info dict
         info = {
             "ticker": self.tickers[self.ticker_count] if self.ticker_count < len(self.tickers) else "unknown",
-            "stock_id": self.current_stock_id,
             "step": self.current_step,
-            "action": action_name,
-            "action_idx": action_idx,
-            "reward": reward,
-            "current_price": current_price,
-            "shares_held": self.shares_held,
-            "holdings_value": self.holdings_value,
-            "balance": self.balance,
+            "execution_type": execution_type,
             "net_worth": self.net_worth,
-            "total_shares_sold": getattr(self, 'total_shares_sold', 0),
-            "total_sales_value": getattr(self, 'total_sales_value', 0),
-            "profit_loss": profit_loss,
-            "trade_executed": trade_executed,
+            "balance": self.balance,
+            "shares_held": self.shares_held,
+            "has_active": self.active_position is not None,
+            "has_pending": self.pending_order is not None,
+            "reward": reward,
+            "cash_pnl": cash_pnl,
+            "realized_pnl_pct": realized_pnl_pct,
+            "fill_event": fill_event,
             "invalid_action": self.is_invalid_action,
-            "current_transaction_fee": current_fee,  # Log dynamic fee for curriculum learning
-            "training_progress": min(self.global_step_count / self.total_training_steps, 1.0) if self.total_training_steps else 0.0,
+            "fill_rate": self.orders_filled / self.orders_placed if self.orders_placed > 0 else 0.0,
+            "avg_entry_discount": self.total_entry_discount / self.orders_placed if self.orders_placed > 0 else 0.0,
+            "trade_executed": realized_pnl_pct != 0,
+            "profit_loss": profit_loss,
         }
 
         # Advance step
         self.current_step += 1
         if self.current_step >= self.n_steps:
-            self._load_df_loop()
-            if self.recent_net_worths:
-                info["recent_run_mean_return"] = self.recent_run_mean_return
-
+            self.done = True
+        
         return self._next_observation(), reward, self.done, False, info
 
-    def _load_df_loop(self) -> None:
-        """Handle end of ticker data and load next with randomization."""
-        final_net_worth = self.end_run()
-        self.recent_net_worths.append(final_net_worth)
-        self.recent_run_mean_return = float(np.mean(self.recent_net_worths))
-        logger.info(f"Ticker complete: reward={self.cum_reward:.4f}, return=£{self.cum_return:.2f}")
-        self.cum_rewards.append(self.cum_reward)
-        self.cum_returns.append(self.cum_return)
+    def _get_current_transaction_fee(self) -> float:
+        """Calculate current transaction fee based on training progress."""
+        if self.total_training_steps is None or self.total_training_steps == 0:
+            return self.config.TRANSACTION_FEE
+        progress = min(self.global_step_count / self.total_training_steps, 1.0)
+        if progress < 0.1:
+            return 0.0
+        adjusted_progress = (progress - 0.1) / 0.9
+        return self.config.TARGET_TRANSACTION_FEE * adjusted_progress
 
-        # Track attempts to avoid infinite loop if all tickers are corrupted
-        max_attempts = len(self.tickers) * 2  # Allow going through list twice
-        attempts = 0
-        
-        while attempts < max_attempts:
-            # Randomly select a ticker for better exploration
-            if hasattr(self, 'np_random') and self.np_random is not None:
-                ticker_idx = self.np_random.integers(0, len(self.tickers))
-            else:
-                # Fallback: sequential
-                ticker_idx = self.ticker_count
-                self.ticker_count += 1
-                if self.ticker_count >= len(self.tickers):
-                    self.ticker_count = 0
-            
-            if self.timesteps is not None and self.current_step >= self.timesteps:
-                self.done = True
-                logger.info("=" * 20 + " END OF RUN " + "=" * 20)
-                self.full_reset = True
-                return
-            
-            # Randomize start position within the ticker's history
-            ticker = self.tickers[ticker_idx]
-            df_temp = self._data_loader(ticker)
-            
-            if len(df_temp) > 0:
-                # Randomly select a start index (leave room for obs_window_size)
-                max_start = max(0, len(df_temp) - self.obs_window_size - 1)
-                if hasattr(self, 'np_random') and self.np_random is not None:
-                    start_index = self.np_random.integers(0, max_start + 1) if max_start > 0 else 0
-                else:
-                    start_index = 0
-                self._load_next_df(ticker_idx, start_index=start_index)
-            else:
-                # Fallback: load from beginning
-                self._load_next_df(ticker_idx, start_index=None)
-            
-            attempts += 1
-            
-            # If we successfully loaded data, break out of the loop
-            if hasattr(self, 'df') and len(self.df) > 0:
-                return
-        
-        # If we've exhausted all attempts and still have empty data, log error and end
-        logger.error(f"Failed to load valid ticker data after {attempts} attempts. Ending episode.")
-        # Set a minimal empty dataframe to prevent further errors
-        self.df = PricesDf(columns=['ticker', 'date', 'open', 'high', 'low', 'close', 'volume'])
-        self.n_steps = 0
-        self.done = True
-
-    def _amend_holding_avco(self) -> None:
-        """Recalculate average cost of holdings."""
-        if not self.holdings:
-            return
-        
-        while self.holdings and self.holdings[0][2] == 0:
-            self.holdings.pop(0)
-        
-        if not self.holdings:
-            return
-            
-        prices, _, changes, _ = zip(*self.holdings)
-        cum_holdings = np.cumsum(changes)
-        cum_values = np.cumsum(np.array(prices) * np.array(changes))
-        avcos = cum_values / cum_holdings
-        self.holdings = list(zip(prices, avcos, changes, cum_holdings))
-
-    def sell(self, current_price: float, proportion: float = 1.00) -> Optional[float]:
+    def calculate_reward(self, fill_event: bool, realized_pnl: float) -> float:
         """
-        Sell shares at current price.
-        Convert proportion of shares into cash (minus transaction fees).
-
-        Args:
-            current_price: Current share price
-            proportion: Proportion of holdings to sell (default 1.0 for 100%)
-
-        Returns:
-            Percentage gain/loss from trade, or None if no trade
+        Calculate reward with multiple components:
+        1. Step Penalty: Efficiency incentive.
+        2. Unrealized PnL: While holding, reward (Current_Val - Prev_Val) / Initial_Balance.
+        3. Realized PnL: On Exit, reward (Exit_Price - Entry_Price) / Entry_Price.
+        4. Fill Reward: Bonus when a Limit Order gets filled.
         """
-        shares_to_sell = int(self.shares_held * proportion)
-        gain_loss = []
+        current_val = self.net_worth
+        prev_val = self.previous_net_worth
         
-        if shares_to_sell > 0:
-            shares_sold = 0
-            while shares_sold < shares_to_sell and self.holdings:
-                this_price, avco, this_shares, _ = self.holdings.pop(0)
-                
-                if this_shares > shares_to_sell - shares_sold:
-                    remaining = this_shares - (shares_to_sell - shares_sold)
-                    self.holdings.insert(0, (this_price, this_price, remaining, remaining))
-                    this_shares = shares_to_sell - shares_sold
-                
-                shares_value = this_shares * current_price
-                # Apply transaction fee: sale value = shares_value * (1 - fee)
-                current_fee = self._get_current_transaction_fee()
-                sale_val = shares_value * (1 - current_fee)
-                
-                self.total_sales_value += sale_val
-                self.balance += sale_val
-                self.cum_return += sale_val - (avco * this_shares)
-                gain_loss.append((sale_val, avco * this_shares))
-                shares_sold += this_shares
+        reward = 0.0
+        
+        # 1. Step Penalty (encourage efficiency)
+        reward += self.config.STEP_PENALTY
+        
+        # 2. Unrealized PnL (While holding)
+        if self.active_position:
+            # Linear return relative to initial balance
+            unrealized_reward = (current_val - prev_val) / self.initial_balance
+            reward += unrealized_reward
+        
+        # 3. Realized PnL (on close)
+        # realized_pnl passed in is already (Exit - Entry) / Entry
+        reward += realized_pnl
+        
+        # 4. Fill Reward
+        if fill_event:
+            reward += self.config.FILL_REWARD
             
-            self.total_shares_sold += shares_sold
-            self.shares_held -= shares_sold
+        # Invalid Action Penalty (Legacy support if needed)
+        if getattr(self, "is_invalid_action", False):
+            reward -= self.config.INVALID_ACTION_PENALTY
             
-            if gain_loss:
-                sale_vals, cost_vals = zip(*gain_loss)
-                return (sum(sale_vals) - sum(cost_vals)) / sum(cost_vals)
-        
-        return None
+        return float(reward)
 
-    def buy(self, current_price: float, proportion: float = 1.00) -> None:
+    def _calculate_limit_price(self, close_price: float, offset_action: float, order_type: str = "buy") -> float:
         """
-        Buy shares at current price.
-        Convert proportion of available cash into stock (minus transaction fees).
-
-        Args:
-            current_price: Current share price
-            proportion: Proportion of balance to use (default 1.0 for 100%)
+        Calculate limit price based on offset action.
+        Buy Limit Price = Current_Close * (1 - (abs(Action[1]) * MAX_LIMIT_OFFSET))
+        Sell Limit Price = Current_Close * (1 + (abs(Action[1]) * MAX_LIMIT_OFFSET))
         """
-        if self.balance <= 0 or current_price is None or current_price <= 0:
-            return
-        
-        # Calculate shares to buy with available cash (after fees)
-        available_cash = self.balance * proportion
-        # Account for transaction fee: cost per share = price * (1 + fee)
-        current_fee = self._get_current_transaction_fee()
-        cost_per_share = current_price * (1 + current_fee)
-        shares_to_buy = int(available_cash / cost_per_share)
-        
-        if shares_to_buy > 0:
-            cost = shares_to_buy * cost_per_share
-            self.balance -= cost
-            self.shares_held += shares_to_buy
-            self.holdings.append((current_price, None, shares_to_buy, self.shares_held))
-            self._amend_holding_avco()
+        offset = abs(offset_action) * self.max_limit_offset
+        if order_type == "buy":
+            return close_price * (1 - offset)
+        else: # sell
+            return close_price * (1 + offset)
 
-    def hold(self, current_price: float, *args, **kwargs) -> None:
-        """Hold current position."""
-        if self.holdings:
-            _, avco, _, _ = self.holdings[-1]
-            self.holdings.append((current_price, avco, 0, self.shares_held))
+    def _calculate_stop_price(self, entry_price: float, sl_action: float) -> float:
+        """
+        Calculate stop price based on SL action.
+        Stop Price = Entry_Price * (1 - (abs(sl_action) * self.config.MAX_STOP_LOSS))
+        """
+        return entry_price * (1 - (abs(sl_action) * self.config.MAX_STOP_LOSS))
+
 
     def _reset_values(self) -> None:
         """Reset environment values."""
@@ -1159,6 +881,15 @@ class StockTradingEnv(gym.Env):
         self.holdings = []
         self.cum_reward = 0.0
         self.cum_return = 0.0
+        
+        # Limit Order State Reset
+        self.pending_order = None
+        self.active_position = None
+        
+        # Statistics Tracking
+        self.orders_placed = 0
+        self.orders_filled = 0
+        self.total_entry_discount = 0.0
         
         if getattr(self, "mode", "train") == "train":
             self.balance = self.initial_balance
@@ -1245,13 +976,12 @@ class StockTradingEnv(gym.Env):
 
     def end_run(self) -> float:
         """End current run and return net worth."""
-        if len(self.df):
-            current_price = self.df.iloc[-1]["raw_close"]
+        if len(self.df) and self.current_step < len(self.df):
+            current_price = self.df.iloc[self.current_step]["raw_close"]
             # Close any open position (long or short)
-            if self.shares_held > 0:
-                self._close_long_position(current_price)
-            elif self.shares_held < 0:
-                self._close_short_position(current_price)
+            if self.active_position:
+                self._liquidate_position(current_price, reason="end_of_run")
+            
             self.holdings_value = self.shares_held * current_price
             self.net_worth = self.balance + self.holdings_value
         return self.net_worth

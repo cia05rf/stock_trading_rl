@@ -19,7 +19,6 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize, DummyVecEnv
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.callbacks import BaseCallback
 
 from shared.config import get_config
 from shared.logging_config import setup_logging, get_logger
@@ -44,7 +43,6 @@ logger = get_logger(__name__)
 def create_env(
     config,
     mode: str = "train",
-    action_space_type: Optional[str] = None,
 ) -> StockTradingEnv:
     """
     Create and configure a trading environment.
@@ -52,7 +50,6 @@ def create_env(
     Args:
         config: Configuration object
         mode: 'train' or 'test'
-        action_space_type: Deprecated - always uses Discrete(3) now
 
     Returns:
         Configured StockTradingEnv instance
@@ -74,7 +71,6 @@ def create_env(
         seed=config.SEED,
         ticker_limit=config.TICKER_LIMIT,
         risk_aversion=config.RISK_AVERSION,
-        action_space_type="discrete",  # Always discrete now (Discrete(3))
     )
 
 
@@ -83,7 +79,6 @@ def train(
     seed: Optional[int] = None,
     device: Optional[str] = None,
     n_envs: int = 1,
-    action_space_type: Optional[str] = None,
     trend_window: int = 5,
 ):
     """
@@ -101,12 +96,6 @@ def train(
     total_timesteps = total_timesteps or config.TOTAL_TIMESTEPS
     seed = seed if seed is not None else config.SEED
     device = device or config.DEVICE
-    # Note: action_space_type is deprecated - always uses Discrete(3) now
-    if action_space_type:
-        logger.warning(
-            f"Action space type '{action_space_type}' is deprecated. "
-            "Using Discrete(3) action space (Hold/Buy/Sell)."
-        )
 
     # Check device availability
     if device == "cuda" and not torch.cuda.is_available():
@@ -114,30 +103,33 @@ def train(
         device = "cpu"
 
     logger.info("=" * 60)
-    logger.info("STARTING PPO TRAINING")
+    logger.info("STARTING PPO TRAINING (CONTINUOUS ACTION SPACE)")
     logger.info("=" * 60)
-    logger.info(f"Device: {device}")
-    logger.info(f"Total timesteps: {total_timesteps:,}")
-    logger.info(f"Seed: {seed}")
-    logger.info(f"N envs: {n_envs}")
-    logger.info(f"Action space: Discrete(3) - Hold/Buy/Sell")
-    logger.info(f"Trading metrics trend window (batches): {trend_window}")
+    logger.info("Device: %s", device)
+    logger.info("Total timesteps: %s", f"{total_timesteps:,}")
+    logger.info("Seed: %s", seed)
+    logger.info("N envs: %s", n_envs)
+    logger.info(
+        "Action space: Box(low=-1, high=1, shape=(3,)) - Signal, Limit Offset, Stop Loss"
+    )
+    logger.info("Trading metrics trend window (batches): %s", trend_window)
 
     # Create run identifier
     run_dt = datetime.now().strftime("%Y%m%d_%H%M")
 
     # Create environment
     if n_envs > 1:
-        logger.info(f"Creating {n_envs} parallel environments")
+        logger.info("Creating %s parallel environments", n_envs)
         env = make_vec_env(
-            lambda: create_env(config, action_space_type=action_space_type),
+            lambda: create_env(config),
             n_envs=n_envs,
             vec_env_cls=SubprocVecEnv
         )
-        # VecNormalize: norm_obs=True (critical for neural network), norm_reward=False (reward already scaled)
+        # VecNormalize: norm_obs=True (critical for neural network)
+        # norm_reward=False (reward already scaled)
         env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.0)
     else:
-        env = create_env(config, action_space_type=action_space_type)
+        env = create_env(config)
         check_env(env, warn=True)
         # Wrap single environment in VecNormalize
         env = DummyVecEnv([lambda: env])
@@ -162,11 +154,15 @@ def train(
     # Get num_stocks from environment
     num_stocks = getattr(base_env, 'num_stocks', 1)
     embedding_dim = 16  # Embedding dimension for stock IDs
-    logger.info(f"Number of stocks: {num_stocks}, Embedding dimension: {embedding_dim}")
+    logger.info(
+        "Number of stocks: %s, Embedding dimension: %s", 
+        num_stocks, 
+        embedding_dim
+    )
 
     # Get observation space info
     if isinstance(env.observation_space, gym.spaces.Box):
-        # New observation space is flattened: (obs_window_size * 9,)
+        # New observation space is flattened: (obs_window_size * 10,)
         obs_shape = env.observation_space.shape
         if len(obs_shape) == 1:
             # Flattened observation space
@@ -180,19 +176,14 @@ def train(
         input_dim = gym.spaces.utils.flatdim(env.observation_space)
         window_size = None
 
-    if isinstance(env.action_space, gym.spaces.Discrete):
+    if isinstance(env.action_space, gym.spaces.Box):
+        action_dim = int(np.prod(env.action_space.shape))
+        action_names = ["signal", "limit_offset", "stop_loss"]
+    elif isinstance(env.action_space, gym.spaces.Discrete):
         action_dim = int(env.action_space.n)
-        # New action space: Discrete(3) - Hold, Buy, Sell
-        if action_dim == 3:
-            action_names = ["hold", "buy", "sell"]
-        else:
-            # Fallback for backward compatibility
-            action_names = ["hold", "buy", "sell"][:action_dim]
+        action_names = ["hold", "buy", "sell"][:action_dim]
     else:
-        raise ValueError(
-            f"Unsupported action space: {type(env.action_space)}. "
-            "Expected Discrete(3)."
-        )
+        raise ValueError(f"Unsupported action space: {type(env.action_space)}")
 
     logger.info(
         "Input dim: %s, Window size: %s, Actions: %s",
@@ -201,10 +192,7 @@ def train(
         action_dim,
     )
 
-    # Action space is always Discrete(3) now
-    is_continuous = False
-    
-    # Entropy coefficient from config (high exploration to prevent freezing)
+    # Entropy coefficient from config
     ent_coef = config.ENTROPY_COEF
 
     # Network hyperparameters
@@ -212,27 +200,27 @@ def train(
     sequence_lengths = [16, 64, 256]
     num_lstm_layers = 2
 
-    # Learning rate schedule - warmup (start low, go high) then exponential decay
+    # Learning rate schedule - warmup then exponential decay
     lr_schedule = warmup_exponential_schedule(
-        initial_value=config.LR_WARMUP_START,  # Start low
-        peak_value=config.LR_PEAK,  # Go high
-        final_value=config.LEARNING_RATE_END,  # Decay to final
+        initial_value=config.LR_WARMUP_START,
+        peak_value=config.LR_PEAK,
+        final_value=config.LEARNING_RATE_END,
         warmup_fraction=config.LR_WARMUP_FRACTION,
         decay_fraction=config.LR_DECAY_FRACTION,
     )
 
-    # Create PPO model with updated hyperparameters
+    # Create PPO model
     model = PPO(
         policy=MultiScaleActorCriticPolicy,
         env=env,
         verbose=1,
         device=device,
-        learning_rate=lr_schedule,  # Warmup then exponential decay schedule
-        n_steps=2048,  # Stable gradients
-        batch_size=128,  # Stable gradients
+        learning_rate=lr_schedule,
+        n_steps=2048,
+        batch_size=128,
         n_epochs=config.EPOCHS,
         clip_range=0.2,
-        ent_coef=ent_coef,  # From config
+        ent_coef=ent_coef,
         vf_coef=0.5,
         max_grad_norm=0.5,
         tensorboard_log=str(config.TB_LOG_DIR),
@@ -241,9 +229,9 @@ def train(
         seed=seed,
         policy_kwargs=dict(
             features_extractor_class=IdentityFeaturesExtractor,
-            input_dim=9,  # Features per timestep (not total flattened size)
-            obs_window_size=config.OBS_WINDOW_SIZE,  # For policy reshaping
-            n_features=9,  # For policy reshaping
+            input_dim=10,  # 10 features per timestep now
+            obs_window_size=config.OBS_WINDOW_SIZE,
+            n_features=10,
             actor_hidden_dim=hidden_dim,
             critic_hidden_dim=hidden_dim,
             action_dim=action_dim,
@@ -283,16 +271,26 @@ def train(
         total_timesteps=actual_timesteps,
         start_hold_reward=0.05,
         end_hold_reward=0.0,
+        start_limit_offset=config.START_LIMIT_OFFSET,
+        end_limit_offset=config.MAX_LIMIT_OFFSET,
     )
     # Custom metrics callback for episode-level metrics
     episode_metrics = EpisodeMetricsCallback(verbose=1)
-    # Curriculum fee callback to set total training steps for dynamic fee calculation
+    # Curriculum fee callback to set total training steps for dynamic fee calc
     from training.callbacks import CurriculumFeeCallback
     curriculum_fee = CurriculumFeeCallback(
         total_timesteps=actual_timesteps,
         verbose=1
     )
-    callbacks = [curriculum_fee, stock_id_updater, info_logger, gradient_monitor, trading_metrics, curriculum, episode_metrics]
+    callbacks = [
+        curriculum_fee, 
+        stock_id_updater, 
+        info_logger, 
+        gradient_monitor, 
+        trading_metrics, 
+        curriculum, 
+        episode_metrics
+    ]
 
     # Train
     try:
@@ -309,12 +307,12 @@ def train(
     models_dir.mkdir(parents=True, exist_ok=True)
     model_path = models_dir / f"ppo_stock_trading_{run_dt}"
     model.save(str(model_path))
-    logger.info(f"Model saved to {model_path}")
+    logger.info("Model saved to %s", model_path)
 
     if n_envs > 1:
         vec_norm_path = models_dir / f"vec_normalize_{run_dt}.pkl"
         env.save(str(vec_norm_path))
-        logger.info(f"VecNormalize saved to {vec_norm_path}")
+        logger.info("VecNormalize saved to %s", vec_norm_path)
 
     # Return training info for analysis
     return model, info_logger.info_history
@@ -344,12 +342,6 @@ def main():
         help="Number of environments",
     )
     parser.add_argument(
-        "--action-space-type",
-        type=str,
-        choices=["discrete", "continuous"],
-        help="Action space type for the environment/policy",
-    )
-    parser.add_argument(
         "--trend-window",
         type=int,
         default=5,
@@ -367,7 +359,6 @@ def main():
         seed=args.seed,
         device=args.device,
         n_envs=args.n_envs,
-        action_space_type=args.action_space_type,
         trend_window=args.trend_window,
     )
 

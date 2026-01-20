@@ -38,6 +38,35 @@ intraday-price-fetch/
 └── logs/                # Log files
 ```
 
+## 🎯 Active Sniper Mode (Limit Position Management)
+
+The system uses an **"Active Sniper"** architecture with continuous control over entries and exits. The agent doesn't just buy and hope; it sets traps (Buy Limits), protects them with hard Stop Losses, and actively manages exits (Sell Limits).
+
+### 🧠 Logic & Strategy
+*   **The "Trap" (Entry):** The agent places a Buy Limit order at a calculated discount. If the price never drops to trigger the trap, no capital is risked (TTL expiry).
+*   **Active Management (Exit):** Unlike fixed "Take Profit" brackets, the agent must actively decide when to place a Sell Limit to exit a position based on evolving market conditions.
+*   **Hard Protection:** Every entry is automatically protected by a Stop Loss, which is checked intra-candle for maximum safety.
+
+### 📥 Inputs & 📤 Outputs
+*   **Inputs (Observation Space):** 
+    *   10 features per timestep: `[Log_Return, Volume_Change, Volatility, RSI, MACD, Time_Sin, Time_Cos, Has_Pending_Order, Has_Active_Position, Unrealized_PnL]`.
+    *   Processed via a **Multi-Scale LSTM** capturing patterns at 16, 64, and 256 steps.
+*   **Outputs (3D Continuous Action Space):**
+    1.  **Signal Strength ($[-1, 1]$):** 
+        *   *No Position:* $> 0.3$ = Place **BUY LIMIT**.
+        *   *Active Position:* $< -0.3$ = Place **SELL LIMIT** (Exit).
+        *   *Otherwise:* HOLD / CANCEL pending orders.
+    2.  **Limit Offset ($[-1, 1]$):** Determines entry/exit aggressiveness.
+        *   `Buy_Price = Close * (1 - (abs(Action[1]) * MAX_LIMIT_OFFSET))`
+        *   `Sell_Price = Close * (1 + (abs(Action[1]) * MAX_LIMIT_OFFSET))`
+    3.  **Stop Loss Offset ($[-1, 1]$):** (Entry only)
+        *   `Stop_Price = Entry_Price * (1 - (abs(Action[2]) * MAX_STOP_LOSS))`
+
+### ⚙️ Mechanics
+*   **Order Execution Phase:** Every step begins by checking for Stop Loss hits (pessimistic assumption: SL always hits first) and Limit Order fills using the current candle's **High/Low**.
+*   **TTL (Time To Live):** Pending orders have a default lifespan of 4 steps (1 hour). If not filled, they are auto-cancelled.
+*   **Execution Ranking:** In backtesting, if multiple tickers generate signals, they are ranked by `abs(Signal) * Predicted_Discount` to prioritize the most confident and efficient trades.
+
 ## 🚀 Quick Start
 
 ### Prerequisites
@@ -76,7 +105,8 @@ cp env.example .env
 API_KEY=your_eodhd_api_key
 DEVICE=cuda
 LOG_LEVEL=INFO
-ACTION_SPACE_TYPE=discrete
+# Sniper Mode requires continuous action space
+ACTION_SPACE_TYPE=continuous
 ```
 
 ## 📊 Data Pipeline
@@ -131,41 +161,41 @@ HDF5_FILE=data/prices_highly_liquid.h5
 
 ## 🤖 Training
 
-Train a PPO agent for stock trading:
+Train the Sniper agent using PPO with continuous actions:
 
 ```bash
-# Basic training
-python training/train_ppo.py
-
-# With options
-python training/train_ppo.py --timesteps 1000000 --device cuda
-
-# Choose action space (hybrid action-space support)
-python training/train_ppo.py --action-space-type discrete
+# Basic training (recommended for Sniper Mode)
 python training/train_ppo.py --action-space-type continuous
+
+# With custom timesteps
+python training/train_ppo.py --timesteps 2000000 --device cuda
 
 # Monitor with TensorBoard
 tensorboard --logdir training/tensorboard_logs/
 ```
 
-## 📈 Evaluation
+## 📈 Evaluation & Backtesting
 
-Run backtests on trained models:
+The backtester simulates a realistic Limit Order Book environment:
 
 ```python
 from eval.backtest import run_backtest
 from eval.analysis import generate_report
 
-# Run backtest
+# Run realistic Limit Order backtest
 results = run_backtest(
     start_date="2024-01-01",
     end_date="2024-06-30",
     initial_balance=10000,
 )
 
-# Generate report
+# The summary now includes Fill_Rate and Orders_Placed vs Filled
+print(results.summary())
+
+# Generate detailed PDF/HTML report
 generate_report(results.to_dataframe(), output_dir="./reports")
 ```
+
 
 ## 📊 Visualization
 

@@ -347,6 +347,8 @@ class TradingMetricsCallback(BaseCallback):
         self.actions: List[int] = []
         self.action_groups: List[str] = []  # buy/sell/hold/waiting
         self.trade_profits: List[float] = []
+        self.fill_rates: List[float] = []
+        self.entry_discounts: List[float] = []
         self.initial_balance = 10000.0  # Will be updated from env
         self.recent_run_means: List[float] = []
         self._is_continuous: bool = False
@@ -358,6 +360,8 @@ class TradingMetricsCallback(BaseCallback):
         self._last_action_groups_idx: int = 0
         self._last_trade_profits_idx: int = 0
         self._last_recent_run_means_idx: int = 0
+        self._last_fill_rates_idx: int = 0
+        self._last_entry_discounts_idx: int = 0
 
         # Rolling window buffers over the last N log batches
         self._trend_buffers: Dict[str, Deque[float]] = {}
@@ -423,13 +427,20 @@ class TradingMetricsCallback(BaseCallback):
                 self.returns.append(info['profit_loss'])
 
             # Track profitable trades
-            if info.get('trade_executed') and 'reward' in info:
-                if info['reward'] != 0:
-                    self.trade_profits.append(info['reward'])
+            if info.get('trade_executed'):
+                # Use realized_pnl_pct if available, otherwise fallback to reward
+                trade_profit = info.get('realized_pnl_pct', info.get('reward', 0))
+                if trade_profit != 0:
+                    self.trade_profits.append(trade_profit)
 
             # Track smoothed per-ticker returns for curriculum/competence
             if 'recent_run_mean_return' in info:
                 self.recent_run_means.append(info['recent_run_mean_return'])
+            
+            if 'fill_rate' in info:
+                self.fill_rates.append(info['fill_rate'])
+            if 'avg_entry_discount' in info:
+                self.entry_discounts.append(info['avg_entry_discount'])
 
         # Track actions
         if len(actions) > 0:
@@ -555,6 +566,16 @@ class TradingMetricsCallback(BaseCallback):
             if self.recent_run_means
             else []
         )
+        batch_fill_rates = (
+            self.fill_rates[self._last_fill_rates_idx:]
+            if self.fill_rates
+            else []
+        )
+        batch_entry_discounts = (
+            self.entry_discounts[self._last_entry_discounts_idx:]
+            if self.entry_discounts
+            else []
+        )
 
         self._last_returns_idx = len(self.returns)
         self._last_net_worths_idx = len(self.net_worths)
@@ -562,6 +583,8 @@ class TradingMetricsCallback(BaseCallback):
         self._last_action_groups_idx = len(self.action_groups)
         self._last_trade_profits_idx = len(self.trade_profits)
         self._last_recent_run_means_idx = len(self.recent_run_means)
+        self._last_fill_rates_idx = len(self.fill_rates)
+        self._last_entry_discounts_idx = len(self.entry_discounts)
 
         # Calculate Sharpe ratio
         sharpe_raw = self._calculate_sharpe_ratio(batch_returns)
@@ -672,6 +695,17 @@ class TradingMetricsCallback(BaseCallback):
         self.logger.record("trading/total_trades", trades_trend)
         self.logger.record("trading_raw/total_trades", float(len(self.trade_profits)))
         self.logger.record("trading_raw/trades_batch", trades_raw)
+
+        # Log Fill Rate and Entry Discount
+        if batch_fill_rates:
+            fr_raw = float(batch_fill_rates[-1])
+            self.logger.record("trading/fill_rate", self._trend_push("fill_rate", fr_raw))
+            self.logger.record("trading_raw/fill_rate", fr_raw)
+        
+        if batch_entry_discounts:
+            ed_raw = float(batch_entry_discounts[-1])
+            self.logger.record("trading/avg_entry_discount", self._trend_push("avg_entry_discount", ed_raw))
+            self.logger.record("trading_raw/avg_entry_discount", ed_raw)
 
         if self.verbose > 0:
             logger.info(

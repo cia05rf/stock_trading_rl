@@ -514,6 +514,37 @@ def compare_strategies(
     return fig
 
 
+def print_summary(metrics: dict, strategy_name: str) -> None:
+    """Pretty-print core metrics to stdout."""
+    def fmt_ratio(value: float) -> str:
+        if value == float("inf"):
+            return "∞"
+        if value == float("-inf"):
+            return "-∞"
+        return f"{value:.2f}"
+    
+    print("\n" + "=" * 70)
+    print(f"{strategy_name} ANALYSIS")
+    print("=" * 70)
+    print(f"Total Trades:        {metrics.get('total_trades', 0)}")
+    print(f"Winning Trades:      {metrics.get('winning_trades', 0)}")
+    print(f"Losing Trades:       {metrics.get('losing_trades', 0)}")
+    print(f"Win Rate:            {metrics.get('win_rate', 0):.1%}")
+    print("-" * 70)
+    print(f"Initial Balance:     £{metrics.get('initial_balance', 0):,.2f}")
+    print(f"Final Balance:       £{metrics.get('final_balance', 0):,.2f}")
+    print(f"Total Return:        £{metrics.get('total_return', 0):,.2f} ({metrics.get('return_pct', 0):.2f}%)")
+    print("-" * 70)
+    print(f"Sharpe Ratio:        {fmt_ratio(metrics.get('sharpe_ratio', 0))}")
+    print(f"Sortino Ratio:       {fmt_ratio(metrics.get('sortino_ratio', 0))}")
+    print(f"Calmar Ratio:        {fmt_ratio(metrics.get('calmar_ratio', 0))}")
+    print(f"Profit Factor:       {fmt_ratio(metrics.get('profit_factor', 0))}")
+    print("-" * 70)
+    print(f"Max Drawdown:        {metrics.get('max_drawdown_pct', 0):.2f}%")
+    print(f"Expectancy:          £{metrics.get('expectancy', 0):,.2f} per trade")
+    print("=" * 70 + "\n")
+
+
 def generate_report(
     ledger_df: pd.DataFrame,
     output_dir: Optional[str] = None,

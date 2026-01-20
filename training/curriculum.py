@@ -25,15 +25,19 @@ class CurriculumCallback(BaseCallback):
         total_timesteps: Optional[int],
         start_hold_reward: float = 0.05,
         end_hold_reward: float = 0.0,
+        start_limit_offset: Optional[float] = None,
+        end_limit_offset: Optional[float] = None,
         verbose: int = 0,
     ):
         super().__init__(verbose)
         self.total_timesteps = max(int(total_timesteps or 1), 1)
         self.start_hold_reward = start_hold_reward
         self.end_hold_reward = end_hold_reward
+        self.start_limit_offset = start_limit_offset
+        self.end_limit_offset = end_limit_offset
 
-    def _set_hold_reward(self, value: float) -> None:
-        """Propagate the hold_reward to underlying environments."""
+    def _set_env_attr(self, attr_name: str, value: float) -> None:
+        """Propagate an attribute value to underlying environments."""
         envs = []
         try:
             if hasattr(self.training_env, "envs"):
@@ -47,22 +51,34 @@ class CurriculumCallback(BaseCallback):
 
         for env in envs:
             base_env = getattr(env, "env", env)
-            # Unwrap one more level if needed
-            base_env = getattr(base_env, "env", base_env)
-            if hasattr(base_env, "hold_reward"):
-                base_env.hold_reward = value
+            # Unwrap levels if needed (VecNormalize, etc.)
+            while hasattr(base_env, "env"):
+                base_env = base_env.env
+            
+            if hasattr(base_env, attr_name):
+                setattr(base_env, attr_name, value)
 
     def _on_step(self) -> bool:
-        """Update hold_reward based on remaining training progress."""
+        """Update curriculum parameters based on remaining training progress."""
         progress_remaining = getattr(self.model, "_current_progress_remaining", None)
         if progress_remaining is None:
             # Fallback using timesteps if SB3 internal attribute is unavailable
             progress_remaining = 1.0 - min(self.num_timesteps / self.total_timesteps, 1.0)
 
+        # 1. Update Hold Reward
         hold_reward = self.end_hold_reward + (self.start_hold_reward - self.end_hold_reward) * max(
             progress_remaining, 0.0
         )
-        self._set_hold_reward(hold_reward)
+        self._set_env_attr("hold_reward", hold_reward)
         self.logger.record("curriculum/hold_reward", hold_reward)
+
+        # 2. Update Limit Offset (if configured)
+        if self.start_limit_offset is not None and self.end_limit_offset is not None:
+            limit_offset = self.end_limit_offset + (self.start_limit_offset - self.end_limit_offset) * max(
+                progress_remaining, 0.0
+            )
+            self._set_env_attr("max_limit_offset", limit_offset)
+            self.logger.record("curriculum/max_limit_offset", limit_offset)
+
         return True
 

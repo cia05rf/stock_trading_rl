@@ -558,9 +558,9 @@ class Config:
     def ENTROPY_COEF(self) -> float:
         """
         Entropy coefficient.
-        INCREASED from 0.05 to 0.2 to force the agent out of the "Wait" local optimum.
+        Set to 0.01 for continuous control to maintain exploration.
         """
-        return float(os.getenv("ENTROPY_COEF", "0.05"))
+        return float(os.getenv("ENTROPY_COEF", "0.01"))
     
     @property
     def CASH_DECAY(self) -> float:
@@ -575,6 +575,36 @@ class Config:
     def TRADING_THRESHOLD(self) -> float:
         """Threshold above or below which a buy or sell trade will be executed"""
         return float(os.getenv("TRADING_THRESHOLD", "0.10"))
+    
+    @property
+    def MAX_LIMIT_OFFSET(self) -> float:
+        """Maximum offset for limit orders relative to current price (e.g., 0.02 = 2%)."""
+        return float(os.getenv("MAX_LIMIT_OFFSET", "0.02"))
+    
+    @property
+    def START_LIMIT_OFFSET(self) -> float:
+        """Starting limit offset for curriculum (wider = easier)."""
+        return float(os.getenv("START_LIMIT_OFFSET", "0.05"))
+    
+    @property
+    def MAX_STOP_LOSS(self) -> float:
+        """Maximum stop loss relative to entry price (e.g., 0.05 = 5%)."""
+        return float(os.getenv("MAX_STOP_LOSS", "0.05"))
+    
+    @property
+    def ORDER_TTL(self) -> int:
+        """Time To Live for pending orders in steps."""
+        return int(os.getenv("ORDER_TTL", "4"))
+    
+    @property
+    def FILL_REWARD(self) -> float:
+        """Reward for a limit order being filled."""
+        return float(os.getenv("FILL_REWARD", "0.001"))
+    
+    @property
+    def STEP_PENALTY(self) -> float:
+        """Small penalty for every step to encourage efficiency."""
+        return float(os.getenv("STEP_PENALTY", "-0.0001"))
     
     # =========================================================================
     # EXCHANGE CONFIGURATIONS
