@@ -42,9 +42,11 @@ def analyze_results(ledger_df: pd.DataFrame) -> Dict:
         ledger_df["date"] = pd.to_datetime(ledger_df["date"], errors="coerce")
     
     # Basic metrics
-    total_trades = len(ledger_df)
-    buy_trades = len(ledger_df[ledger_df["action"] == "buy"])
-    sell_trades = len(ledger_df[ledger_df["action"] == "sell"])
+    # Only count completed trades (exits) for trade count and win rate metrics
+    completed_trades_df = ledger_df[ledger_df["pnl"] != 0]
+    total_trades = len(completed_trades_df)
+    buy_trades = len(ledger_df[ledger_df["action_type"] == "buy"])
+    sell_trades = len(ledger_df[ledger_df["action_type"] == "sell"])
     
     # Returns
     initial_balance = ledger_df["balance_pre_trade"].iloc[0]

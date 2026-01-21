@@ -768,8 +768,14 @@ class StockTradingEnv(gym.Env):
             self.done = True
             return self._next_observation(), -100.0, self.done, False, {"bankruptcy": True}
 
+        # Calculate log return for reward scaling
+        if self.previous_net_worth > 0 and self.net_worth > 0:
+            log_return = float(np.log(self.net_worth / self.previous_net_worth))
+        else:
+            log_return = 0.0
+
         # Calculate reward
-        reward = self.calculate_reward(fill_event, realized_pnl_pct)
+        reward = self.calculate_reward(fill_event, realized_pnl_pct, log_return)
         self.cum_reward += reward
         
         # Track history
@@ -816,17 +822,14 @@ class StockTradingEnv(gym.Env):
         adjusted_progress = (progress - 0.1) / 0.9
         return self.config.TARGET_TRANSACTION_FEE * adjusted_progress
 
-    def calculate_reward(self, fill_event: bool, realized_pnl: float) -> float:
+    def calculate_reward(self, fill_event: bool, realized_pnl: float, log_return: float) -> float:
         """
         Calculate reward with multiple components:
         1. Step Penalty: Efficiency incentive.
-        2. Unrealized PnL: While holding, reward (Current_Val - Prev_Val) / Initial_Balance.
+        2. Unrealized PnL: Logarithmic return of net worth.
         3. Realized PnL: On Exit, reward (Exit_Price - Entry_Price) / Entry_Price.
         4. Fill Reward: Bonus when a Limit Order gets filled.
         """
-        current_val = self.net_worth
-        prev_val = self.previous_net_worth
-        
         reward = 0.0
         
         # 1. Step Penalty (encourage efficiency)
@@ -834,9 +837,8 @@ class StockTradingEnv(gym.Env):
         
         # 2. Unrealized PnL (While holding)
         if self.active_position:
-            # Linear return relative to initial balance
-            unrealized_reward = (current_val - prev_val) / self.initial_balance
-            reward += unrealized_reward
+            # Use logarithmic return as requested
+            reward += log_return
         
         # 3. Realized PnL (on close)
         # realized_pnl passed in is already (Exit - Entry) / Entry

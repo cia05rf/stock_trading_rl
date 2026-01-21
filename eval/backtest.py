@@ -123,9 +123,11 @@ class MockFund:
         date,
         ticker: str,
         action: str, # buy/sell/close/stop_loss
+        action_type: str, # buy/sell
         price: float,
         quantity: int,
         trade_value: float,
+        balance_pre: float,
         balance_post: float,
         pnl: float = 0.0,
         pnl_pct: float = 0.0,
@@ -135,10 +137,12 @@ class MockFund:
             "date": pd.to_datetime(date),
             "ticker": ticker,
             "action": action,
+            "action_type": action_type,
             "price": price,
             "quantity": quantity,
             "trade_value": trade_value,
-            "balance": balance_post,
+            "balance_pre_trade": balance_pre,
+            "balance_post_trade": balance_post,
             "pnl": pnl,
             "pnl_pct": pnl_pct,
         }
@@ -311,6 +315,7 @@ class MockFund:
             if quantity > 0:
                 trade_value = quantity * fill_price
                 total_cost = quantity * cost_per_share
+                balance_pre = self.balance
                 self.balance -= total_cost
                 self.open_positions[order["ticker"]] = {
                     "type": "long",
@@ -320,7 +325,7 @@ class MockFund:
                 }
                 self.orders_filled += 1
                 self.ledger.append(self._create_ledger_entry(
-                    timestamp, order["ticker"], "buy", fill_price, quantity, trade_value, self.balance
+                    timestamp, order["ticker"], "buy", "buy", fill_price, quantity, trade_value, balance_pre, self.balance
                 ))
         else: # short
             # Note: Proceeds from shorting are added to balance
@@ -328,6 +333,7 @@ class MockFund:
             if quantity > 0:
                 trade_value = quantity * fill_price
                 proceeds = trade_value * (1 - current_fee)
+                balance_pre = self.balance
                 self.balance += proceeds
                 self.open_positions[order["ticker"]] = {
                     "type": "short",
@@ -337,7 +343,7 @@ class MockFund:
                 }
                 self.orders_filled += 1
                 self.ledger.append(self._create_ledger_entry(
-                    timestamp, order["ticker"], "sell", fill_price, quantity, trade_value, self.balance
+                    timestamp, order["ticker"], "sell", "sell", fill_price, quantity, trade_value, balance_pre, self.balance
                 ))
 
     def _liquidate(self, ticker: str, exit_price: float, timestamp: pd.Timestamp, reason: str = "manual") -> None:
@@ -347,21 +353,24 @@ class MockFund:
             
         pos = self.open_positions.pop(ticker)
         current_fee = self.config.TARGET_TRANSACTION_FEE
+        balance_pre = self.balance
         
         if pos["type"] == "long":
             exit_value = pos["quantity"] * exit_price * (1 - current_fee)
             pnl = exit_value - (pos["quantity"] * pos["entry_price"])
             pnl_pct = (exit_price * (1 - current_fee) - pos["entry_price"]) / pos["entry_price"]
             self.balance += exit_value
+            action_type = "sell"
         else: # short
             exit_cost = pos["quantity"] * exit_price * (1 + current_fee)
             entry_proceeds = pos["quantity"] * pos["entry_price"]
             pnl = (entry_proceeds * (1 - current_fee)) - exit_cost
             pnl_pct = (pos["entry_price"] * (1 - current_fee) - exit_price * (1 + current_fee)) / pos["entry_price"]
             self.balance -= exit_cost
+            action_type = "buy"
             
         self.ledger.append(self._create_ledger_entry(
-            timestamp, ticker, reason, exit_price, pos["quantity"], pos["quantity"] * exit_price, self.balance, pnl, pnl_pct
+            timestamp, ticker, reason, action_type, exit_price, pos["quantity"], pos["quantity"] * exit_price, balance_pre, self.balance, pnl, pnl_pct
         ))
 
     def _record_equity(self, timestamp: pd.Timestamp, prices_by_ticker: Dict[str, PricesDf]) -> None:

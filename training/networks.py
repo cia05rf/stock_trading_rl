@@ -10,6 +10,7 @@ from typing import List, Tuple, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
 from shared.logging_config import get_logger
 
@@ -86,7 +87,8 @@ class MultiScaleActorCritic(nn.Module):
             self.act_fc2 = nn.Linear(actor_hidden_dim, self.actor_out_dim)
             # Separate state-independent learnable parameter for log_std
             # We'll use a parameter that will be passed through softplus to ensure positivity
-            self.log_std_logits = nn.Parameter(torch.zeros(self.actor_out_dim))
+            # Initializing to -0.5 results in softplus(-0.5) ≈ 0.47 std dev, helping gradients
+            self.log_std_logits = nn.Parameter(torch.full((self.actor_out_dim,), -0.5))
         else:
             self.actor_out_dim = action_dim
             self.act_fc2 = nn.Linear(actor_hidden_dim, self.actor_out_dim)
@@ -103,12 +105,31 @@ class MultiScaleActorCritic(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize network weights."""
-        for module in self.modules():
+        """Initialize network weights with appropriate gains."""
+        for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
-                nn.init.orthogonal_(module.weight, gain=0.01)
+                if "fc2" in name:
+                    # Final output layers use a small gain
+                    nn.init.orthogonal_(module.weight, gain=0.01)
+                else:
+                    # Hidden layers use ReLU-appropriate gain
+                    nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+                
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
+            
+            elif isinstance(module, nn.LSTM):
+                # LSTM weights initialization
+                for name, param in module.named_parameters():
+                    if "weight_ih" in name:
+                        nn.init.orthogonal_(param.data)
+                    elif "weight_hh" in name:
+                        nn.init.orthogonal_(param.data)
+                    elif "bias" in name:
+                        nn.init.constant_(param.data, 0)
+                        # Foget gate bias initialization to 1.0
+                        n = param.size(0)
+                        param.data[n // 4 : n // 2].fill_(1.0)
 
     def _extract_features(self, state: torch.Tensor, stock_id: Optional[torch.Tensor] = None) -> torch.Tensor:
         """

@@ -126,14 +126,18 @@ def train(
             vec_env_cls=SubprocVecEnv
         )
         # VecNormalize: norm_obs=True (critical for neural network)
-        # norm_reward=False (reward already scaled)
-        env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.0)
+        # norm_reward=True (normalized for critic stability)
+        env = VecNormalize(
+            env, norm_obs=True, norm_reward=True, clip_obs=10.0, clip_reward=10.0
+        )
     else:
         env = create_env(config)
         check_env(env, warn=True)
         # Wrap single environment in VecNormalize
         env = DummyVecEnv([lambda: env])
-        env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.0)
+        env = VecNormalize(
+            env, norm_obs=True, norm_reward=True, clip_obs=10.0, clip_reward=10.0
+        )
 
     def _unwrap_env(e):
         # VecNormalize wraps a VecEnv in `venv`
