@@ -63,7 +63,24 @@ python training/train_ppo.py
 python training/train_ppo.py --timesteps 1000000 --device cuda --seed 42
 ```
 
-### 4. Monitor Training
+### 4. Fine-Tuning & Resuming
+
+You can resume training from a saved model and its normalization statistics using:
+
+```bash
+python training/train_ppo.py \
+    --resume-model training/models/ppo_stock_trading_20240123_0904.zip \
+    --resume-vec-norm training/models/vec_normalize_20240123_0904.pkl \
+    --timesteps 500000 \
+    --n-envs 4
+```
+
+When resuming:
+- A constant low learning rate is used instead of the warmup schedule.
+- The curriculum difficulty is immediately set to its maximum (`MAX_LIMIT_OFFSET`).
+- `VecNormalize` statistics continue to update.
+
+### 5. Monitor Training
 
 TensorBoard logs are saved to `training/tensorboard_logs/`:
 

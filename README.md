@@ -174,6 +174,24 @@ python training/train_ppo.py --timesteps 2000000 --device cuda
 tensorboard --logdir training/tensorboard_logs/
 ```
 
+### Fine-Tuning & Resuming
+
+You can resume training from a saved model and its environment statistics (`VecNormalize`) using the following flags:
+
+```bash
+# Resume training with a specific model and normalization statistics
+python training/train_ppo.py \
+    --resume-model training/models/ppo_stock_trading_20240123_0904.zip \
+    --resume-vec-norm training/models/vec_normalize_20240123_0904.pkl \
+    --timesteps 500000 \
+    --n-envs 4
+```
+
+**Key Fine-Tuning Behaviors:**
+*   **Constant Learning Rate:** Automatically switches from a warmup schedule to a constant low learning rate (using `LEARNING_RATE_END`).
+*   **Instant Difficulty:** The curriculum starting point is adjusted to maximum difficulty (`MAX_LIMIT_OFFSET`) when resuming.
+*   **Continuous Stats:** Environment normalization statistics continue to update during the fine-tuning phase.
+
 ## 📈 Evaluation & Backtesting
 
 The backtester simulates a realistic Limit Order Book environment:

@@ -579,7 +579,7 @@ class Config:
     @property
     def MAX_LIMIT_OFFSET(self) -> float:
         """Maximum offset for limit orders relative to current price (e.g., 0.02 = 2%)."""
-        return float(os.getenv("MAX_LIMIT_OFFSET", "0.02"))
+        return float(os.getenv("MAX_LIMIT_OFFSET", "0.05"))
     
     @property
     def START_LIMIT_OFFSET(self) -> float:
@@ -589,7 +589,7 @@ class Config:
     @property
     def MAX_STOP_LOSS(self) -> float:
         """Maximum stop loss relative to entry price (e.g., 0.05 = 5%)."""
-        return float(os.getenv("MAX_STOP_LOSS", "0.05"))
+        return float(os.getenv("MAX_STOP_LOSS", "0.03"))
     
     @property
     def ORDER_TTL(self) -> int:

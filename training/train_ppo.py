@@ -9,6 +9,7 @@ Usage:
 """
 
 import argparse
+import os
 from datetime import datetime
 from typing import Optional
 
@@ -80,6 +81,8 @@ def train(
     device: Optional[str] = None,
     n_envs: int = 1,
     trend_window: int = 5,
+    resume_model_path: Optional[str] = None,
+    resume_vec_norm_path: Optional[str] = None,
 ):
     """
     Train a PPO agent for stock trading.
@@ -89,6 +92,9 @@ def train(
         seed: Random seed
         device: Device to use (cuda/cpu)
         n_envs: Number of parallel environments
+        trend_window: Trend window for metrics
+        resume_model_path: Path to .zip model to resume
+        resume_vec_norm_path: Path to .pkl VecNormalize to resume
     """
     config = get_config()
 
@@ -103,7 +109,10 @@ def train(
         device = "cpu"
 
     logger.info("=" * 60)
-    logger.info("STARTING PPO TRAINING (CONTINUOUS ACTION SPACE)")
+    if resume_model_path:
+        logger.info("RESUMING PPO TRAINING (FINE-TUNING)")
+    else:
+        logger.info("STARTING PPO TRAINING (CONTINUOUS ACTION SPACE)")
     logger.info("=" * 60)
     logger.info("Device: %s", device)
     logger.info("Total timesteps: %s", f"{total_timesteps:,}")
@@ -120,23 +129,29 @@ def train(
     # Create environment
     if n_envs > 1:
         logger.info("Creating %s parallel environments", n_envs)
-        env = make_vec_env(
+        venv = make_vec_env(
             lambda: create_env(config),
             n_envs=n_envs,
             vec_env_cls=SubprocVecEnv
         )
-        # VecNormalize: norm_obs=True (critical for neural network)
-        # norm_reward=True (normalized for critic stability)
-        env = VecNormalize(
-            env, norm_obs=True, norm_reward=True, clip_obs=10.0, clip_reward=10.0
-        )
     else:
-        env = create_env(config)
-        check_env(env, warn=True)
+        env_instance = create_env(config)
+        check_env(env_instance, warn=True)
         # Wrap single environment in VecNormalize
-        env = DummyVecEnv([lambda: env])
+        venv = DummyVecEnv([lambda: env_instance])
+
+    # Handle Normalization (Load or Create)
+    if resume_vec_norm_path and os.path.exists(resume_vec_norm_path):
+        logger.info("Loading VecNormalize stats from %s", resume_vec_norm_path)
+        env = VecNormalize.load(resume_vec_norm_path, venv)
+        # Ensure training is enabled for updates
+        env.training = True
+        env.norm_obs = True
+        env.norm_reward = True
+    else:
+        logger.info("Creating new VecNormalize wrapper")
         env = VecNormalize(
-            env, norm_obs=True, norm_reward=True, clip_obs=10.0, clip_reward=10.0
+            venv, norm_obs=True, norm_reward=True, clip_obs=10.0, clip_reward=10.0
         )
 
     def _unwrap_env(e):
@@ -205,46 +220,66 @@ def train(
     num_lstm_layers = 2
 
     # Learning rate schedule - warmup then exponential decay
-    lr_schedule = warmup_exponential_schedule(
-        initial_value=config.LR_WARMUP_START,
-        peak_value=config.LR_PEAK,
-        final_value=config.LEARNING_RATE_END,
-        warmup_fraction=config.LR_WARMUP_FRACTION,
-        decay_fraction=config.LR_DECAY_FRACTION,
-    )
+    if resume_model_path:
+        # Constant low LR for fine-tuning
+        lr_schedule = config.LEARNING_RATE_END
+        logger.info("Fine-tuning mode: Using constant LR %s", lr_schedule)
+    else:
+        lr_schedule = warmup_exponential_schedule(
+            initial_value=config.LR_WARMUP_START,
+            peak_value=config.LR_PEAK,
+            final_value=config.LEARNING_RATE_END,
+            warmup_fraction=config.LR_WARMUP_FRACTION,
+            decay_fraction=config.LR_DECAY_FRACTION,
+        )
 
-    # Create PPO model
-    model = PPO(
-        policy=MultiScaleActorCriticPolicy,
-        env=env,
-        verbose=1,
-        device=device,
-        learning_rate=lr_schedule,
-        n_steps=2048,
-        batch_size=128,
-        n_epochs=config.EPOCHS,
-        clip_range=0.2,
-        ent_coef=ent_coef,
-        vf_coef=0.5,
-        max_grad_norm=0.5,
-        tensorboard_log=str(config.TB_LOG_DIR),
-        gamma=0.99,
-        gae_lambda=0.95,
-        seed=seed,
-        policy_kwargs=dict(
-            features_extractor_class=IdentityFeaturesExtractor,
-            input_dim=10,  # 10 features per timestep now
-            obs_window_size=config.OBS_WINDOW_SIZE,
-            n_features=10,
-            actor_hidden_dim=hidden_dim,
-            critic_hidden_dim=hidden_dim,
-            action_dim=action_dim,
-            sequence_lengths=sequence_lengths,
-            num_lstm_layers=num_lstm_layers,
-            num_stocks=num_stocks,
-            embedding_dim=embedding_dim,
-        ),
-    )
+    # Create or load PPO model
+    if resume_model_path and os.path.exists(resume_model_path):
+        logger.info("Loading existing model weights from %s", resume_model_path)
+        model = PPO.load(
+            resume_model_path,
+            env=env,
+            device=device,
+            learning_rate=lr_schedule,
+            tensorboard_log=str(config.TB_LOG_DIR),
+            ent_coef=ent_coef,
+            force_reset=False,
+        )
+        logger.info("Model loaded successfully.")
+    else:
+        logger.info("Initializing new PPO model from scratch.")
+        model = PPO(
+            policy=MultiScaleActorCriticPolicy,
+            env=env,
+            verbose=1,
+            device=device,
+            learning_rate=lr_schedule,
+            n_steps=2048,
+            batch_size=128,
+            n_epochs=config.EPOCHS,
+            clip_range=0.2,
+            ent_coef=ent_coef,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            tensorboard_log=str(config.TB_LOG_DIR),
+            tb_log_name=f"{run_dt}_ppo_stock_trading",
+            gamma=0.99,
+            gae_lambda=0.95,
+            seed=seed,
+            policy_kwargs=dict(
+                features_extractor_class=IdentityFeaturesExtractor,
+                input_dim=10,  # 10 features per timestep now
+                obs_window_size=config.OBS_WINDOW_SIZE,
+                n_features=10,
+                actor_hidden_dim=hidden_dim,
+                critic_hidden_dim=hidden_dim,
+                action_dim=action_dim,
+                sequence_lengths=sequence_lengths,
+                num_lstm_layers=num_lstm_layers,
+                num_stocks=num_stocks,
+                embedding_dim=embedding_dim,
+            ),
+        )
 
     # Calculate total timesteps
     try:
@@ -271,11 +306,20 @@ def train(
         action_names=action_names,
         trend_window=trend_window,
     )
+    
+    # Adjust curriculum for fine-tuning
+    if resume_model_path:
+        # Start at full difficulty
+        curriculum_start_limit_offset = config.MAX_LIMIT_OFFSET
+        logger.info("Fine-tuning: Starting curriculum at MAX_LIMIT_OFFSET")
+    else:
+        curriculum_start_limit_offset = config.START_LIMIT_OFFSET
+
     curriculum = CurriculumCallback(
         total_timesteps=actual_timesteps,
         start_hold_reward=0.05,
         end_hold_reward=0.0,
-        start_limit_offset=config.START_LIMIT_OFFSET,
+        start_limit_offset=curriculum_start_limit_offset,
         end_limit_offset=config.MAX_LIMIT_OFFSET,
     )
     # Custom metrics callback for episode-level metrics
@@ -313,10 +357,10 @@ def train(
     model.save(str(model_path))
     logger.info("Model saved to %s", model_path)
 
-    if n_envs > 1:
-        vec_norm_path = models_dir / f"vec_normalize_{run_dt}.pkl"
-        env.save(str(vec_norm_path))
-        logger.info("VecNormalize saved to %s", vec_norm_path)
+    # Save VecNormalize statistics
+    vec_norm_path = models_dir / f"vec_normalize_{run_dt}.pkl"
+    env.save(str(vec_norm_path))
+    logger.info("VecNormalize saved to %s", vec_norm_path)
 
     # Return training info for analysis
     return model, info_logger.info_history
@@ -351,6 +395,18 @@ def main():
         default=5,
         help="Number of recent metric batches to trend over for TensorBoard trading/* scalars",
     )
+    parser.add_argument(
+        "--resume-model",
+        type=str,
+        default=None,
+        help="Path to .zip file to resume training from",
+    )
+    parser.add_argument(
+        "--resume-vec-norm",
+        type=str,
+        default=None,
+        help="Path to .pkl file for VecNormalize stats (usually saved alongside model)",
+    )
     args = parser.parse_args()
 
     # Setup logging
@@ -364,6 +420,8 @@ def main():
         device=args.device,
         n_envs=args.n_envs,
         trend_window=args.trend_window,
+        resume_model_path=args.resume_model,
+        resume_vec_norm_path=args.resume_vec_norm,
     )
 
 
