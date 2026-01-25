@@ -49,7 +49,8 @@ The system uses an **"Active Sniper"** architecture with continuous control over
 
 ### 📥 Inputs & 📤 Outputs
 *   **Inputs (Observation Space):** 
-    *   10 features per timestep: `[Log_Return, Volume_Change, Volatility, RSI, MACD, Time_Sin, Time_Cos, Has_Pending_Order, Has_Active_Position, Unrealized_PnL]`.
+    *   10 features per timestep: `[Log_Return, Volume_Change, Volatility, RSI, MACD, Time_Sin, Time_Cos, Pending_Order_Dist, Has_Active_Position, Unrealized_PnL]`.
+    *   **Pending_Order_Dist:** Continuous feature representing `(order_price - current_price) / current_price`, clipped at 5% and scaled to $[-1, 1]$. This helps the agent "see" its trap.
     *   Processed via a **Multi-Scale LSTM** capturing patterns at 16, 64, and 256 steps.
 *   **Outputs (3D Continuous Action Space):**
     1.  **Signal Strength ($[-1, 1]$):** 
@@ -64,7 +65,10 @@ The system uses an **"Active Sniper"** architecture with continuous control over
 
 ### ⚙️ Mechanics
 *   **Order Execution Phase:** Every step begins by checking for Stop Loss hits (pessimistic assumption: SL always hits first) and Limit Order fills using the current candle's **High/Low**.
-*   **TTL (Time To Live):** Pending orders have a default lifespan of 4 steps (1 hour). If not filled, they are auto-cancelled.
+*   **Encumbered Cash Accounting:** To prevent "free" limit order spamming, cash is deducted from the balance the moment a Buy Limit order is placed. This "locked cash" is refunded if the order is cancelled or expires.
+*   **Order Latency:** Orders placed at step $t$ are processed against the market data (High/Low/Open) of step $t+1$, enforcing a realistic delay.
+*   **Order Rent (Reward Penalty):** A small "Rent" penalty is applied for every step a limit order remains pending. This discourages the agent from leaving bad orders open and encourages quick cancellations of stale "traps".
+*   **TTL (Time To Live):** Pending orders have a default lifespan of 4 steps (1 hour). If not filled, they are auto-cancelled and cash is refunded.
 *   **Execution Ranking:** In backtesting, if multiple tickers generate signals, they are ranked by `abs(Signal) * Predicted_Discount` to prioritize the most confident and efficient trades.
 
 ## 🚀 Quick Start

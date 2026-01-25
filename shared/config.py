@@ -602,6 +602,15 @@ class Config:
         return float(os.getenv("FILL_REWARD", "0.001"))
     
     @property
+    def PENDING_ORDER_PENALTY(self) -> float:
+        """
+        Penalty applied every step an order sits pending.
+        Acts as 'Rent' or 'Interest' on locked capital.
+        Default to 0.0002.
+        """
+        return float(os.getenv("PENDING_ORDER_PENALTY", "0.0002"))
+    
+    @property
     def STEP_PENALTY(self) -> float:
         """Small penalty for every step to encourage efficiency."""
         return float(os.getenv("STEP_PENALTY", "-0.0001"))

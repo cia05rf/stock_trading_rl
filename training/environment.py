@@ -137,6 +137,7 @@ class StockTradingEnv(gym.Env):
         # Limit Order State
         self.pending_order = None  # {"type": "buy"/"sell", "price": float, "ttl": int}
         self.active_position = None  # {"type": "long"/"short", "entry_price": float, "size": float, "stop_loss": float}
+        self.locked_cash = 0.0
 
         # Load all tickers
         tickers = self.ingestion.read_tickers()
@@ -390,6 +391,7 @@ class StockTradingEnv(gym.Env):
         highs = self.df['high'].values.astype(np.float32)
         lows = self.df['low'].values.astype(np.float32)
         closes = self.df['close'].values.astype(np.float32)
+        opens = self.df['open'].values.astype(np.float32) if 'open' in self.df.columns else prices
         
         # 1. Pre-compute Log Returns: log(Price_t / Price_{t-1})
         # Vectorized: shift prices and compute log ratio
@@ -476,6 +478,7 @@ class StockTradingEnv(gym.Env):
         
         # Store prices array for fast access
         self.prices_array = prices
+        self.opens_array = opens
 
     def _next_observation(self) -> np.ndarray:
         """
@@ -497,7 +500,15 @@ class StockTradingEnv(gym.Env):
         current_price = self.prices_array[self.current_step] if self.current_step < len(self.prices_array) else 0.0
         
         # Calculate account state (dynamic features)
-        has_pending = 1.0 if self.pending_order is not None else 0.0
+        if self.pending_order:
+            pending_price = self.pending_order["price"]
+            # pending_dist = (pending_price - current_price) / current_price
+            # Clip between -0.05 and 0.05 and scale to [-1, 1]
+            dist = (pending_price - current_price) / current_price if current_price > 0 else 0
+            pending_dist = np.clip(dist, -0.05, 0.05) / 0.05
+        else:
+            pending_dist = 0.0
+
         has_active = 1.0 if self.active_position is not None else 0.0
         
         # Current_Unrealized_PnL: (current_price - entry_price) / entry_price for long
@@ -555,7 +566,7 @@ class StockTradingEnv(gym.Env):
             time_cos_window = self.time_cos[start:end]
         
         # Create account state arrays (same value for all timesteps in window)
-        has_pending_window = np.full(self.obs_window_size, has_pending, dtype=np.float32)
+        pending_dist_window = np.full(self.obs_window_size, pending_dist, dtype=np.float32)
         has_active_window = np.full(self.obs_window_size, has_active, dtype=np.float32)
         unrealized_pnl_window = np.full(self.obs_window_size, unrealized_pnl, dtype=np.float32)
         
@@ -568,7 +579,7 @@ class StockTradingEnv(gym.Env):
             macd_normalized_window,
             time_sin_window,
             time_cos_window,
-            has_pending_window,
+            pending_dist_window,
             has_active_window,
             unrealized_pnl_window,
         ])
@@ -616,7 +627,7 @@ class StockTradingEnv(gym.Env):
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict]:
         """
-        Execute an action and return the result.
+        Execute an action and return the result with Order Latency and Encumbered Cash.
         
         Action space: Box(low=-1, high=1, shape=(3,))
         - Action[0]: Signal Strength
@@ -631,6 +642,7 @@ class StockTradingEnv(gym.Env):
         close_price = current_candle["raw_close"]
         high_price = current_candle["high"]
         low_price = current_candle["low"]
+        open_price = self.opens_array[self.current_step]
         
         self.current_price = close_price
         self.prev_balance = self.balance
@@ -644,107 +656,128 @@ class StockTradingEnv(gym.Env):
         cash_pnl = 0.0
         realized_pnl_pct = 0.0
         
-        # --- PHASE A: Order Check (Using Current Candle) ---
-        
-        # A1. Check Active Position for Stop Loss (Pessimistic: SL hits first)
-        if self.active_position:
-            pos = self.active_position
-            if low_price <= pos["stop_loss"]:
-                # Stop Loss hit
-                exit_price = min(pos["stop_loss"], high_price) 
-                cash_pnl, realized_pnl_pct = self._liquidate_position(
-                    exit_price, reason="stop_loss"
-                )
-                execution_type = "stop_loss"
-        
-        # A2. Check Pending Order for Fill (Only if no position or pending exit)
+        current_fee = self._get_current_transaction_fee()
+
+        # --- PHASE A: CHECK FILLS (First) ---
+        # Process the PREVIOUS step's pending_order against CURRENT candle
         if self.pending_order:
             order = self.pending_order
             fill_price = order["price"]
-            filled = False
             
             if order["type"] == "buy" and not self.active_position:
+                # Buy fill: current low must be below limit price
+                # We use a small buffer (0.9995) to be realistic about fills
                 if low_price < fill_price * 0.9995:
-                    filled = True
-                    # Fill at the limit price (or better if open was below)
-                    fill_price = min(fill_price, high_price)
-            elif order["type"] == "sell" and self.active_position:
-                if high_price >= fill_price:
-                    filled = True
-                    # Fill at the limit price (or better if open was above)
-                    fill_price = max(fill_price, low_price)
+                    # If market opened below limit, we fill at open (better price)
+                    fill_price = min(fill_price, open_price)
                     
-            if filled:
-                current_fee = self._get_current_transaction_fee()
-                if order["type"] == "buy":
-                    # Calculate size based on balance
-                    cost_per_share = fill_price * (1 + current_fee)
-                    size = int(self.balance / cost_per_share)
-                    if size > 0:
-                        self.balance -= size * cost_per_share
-                        self.active_position = {
-                            "entry_price": fill_price,
-                            "size": size,
-                            "stop_loss": order["stop_loss"],
-                            "type": "long"  # Only long supported in Sniper mode
-                        }
-                        self.shares_held = size
-                        fill_event = True
-                        self.orders_filled += 1
-                        execution_type = "limit_fill_buy"
-                else:  # sell fill
+                    self.shares_held = order["size"]
+                    
+                    # Cash was ALREADY deducted at placement.
+                    # Refund difference if fill price < limit price
+                    actual_cost = self.shares_held * fill_price * (1 + current_fee)
+                    refund = order["locked_cash"] - actual_cost
+                    self.balance += max(0, refund)
+                    
+                    self.active_position = {
+                        "entry_price": fill_price,
+                        "size": self.shares_held,
+                        "stop_loss": order["stop_loss"],
+                        "type": "long"
+                    }
+                    fill_event = True
+                    self.orders_filled += 1
+                    execution_type = "limit_fill_buy"
+                    self.pending_order = None
+                    self.locked_cash = 0.0
+                    
+            elif order["type"] == "sell" and self.active_position:
+                # Sell fill: current high must be above limit price
+                if high_price >= fill_price:
+                    # If market opened above limit, we fill at open (better price)
+                    fill_price = max(fill_price, open_price)
+                    
                     cash_pnl, realized_pnl_pct = self._liquidate_position(
                         fill_price, reason="limit_fill_sell"
                     )
                     fill_event = True
                     self.orders_filled += 1
                     execution_type = "limit_fill_sell"
-                
-                self.pending_order = None  # Order filled
-        
+                    self.pending_order = None
+
+        # A2. Check Active Position for Stop Loss (Pessimistic)
+        if self.active_position and not execution_type:
+            pos = self.active_position
+            if low_price <= pos["stop_loss"]:
+                # Stop Loss hit. Fill at SL price (or open if opened below SL)
+                exit_price = min(pos["stop_loss"], open_price)
+                cash_pnl, realized_pnl_pct = self._liquidate_position(
+                    exit_price, reason="stop_loss"
+                )
+                execution_type = "stop_loss"
+
         # A3. TTL Check for remaining pending order
         if self.pending_order:
             self.pending_order["ttl"] -= 1
             if self.pending_order["ttl"] <= 0:
+                if self.pending_order["type"] == "buy":
+                    # REFUND LOCKED CASH on TTL expiry
+                    self.balance += self.pending_order["locked_cash"]
+                    self.locked_cash = 0.0
                 self.pending_order = None
                 if not execution_type:
                     execution_type = "ttl_expiry"
-        
-        # --- PHASE B: New Action Processing ---
-        
+
+        # --- PHASE B: NEW ACTIONS (Second) ---
         signal = action[0]
-        if not self.active_position:
-            # If No Position: > 0.3 = Place BUY LIMIT
-            if signal > 0.3:
+
+        # 1. Handle Cancellations (Refunds)
+        # If signal < 0.3 and we have a pending buy, cancel and refund
+        if not self.active_position and self.pending_order and self.pending_order["type"] == "buy":
+            if signal < 0.3:
+                self.balance += self.pending_order["locked_cash"]
+                self.locked_cash = 0.0
+                self.pending_order = None
+                execution_type = "cancel_pending_buy" if not execution_type else execution_type
+
+        # 2. Handle New Orders (Deductions)
+        if not self.active_position and not self.pending_order:
+            if signal > 0.3: # New Buy
                 limit_price = self._calculate_limit_price(close_price, action[1], order_type="buy")
                 stop_loss = self._calculate_stop_price(limit_price, action[2])
-                self.pending_order = {
-                    "type": "buy",
-                    "price": limit_price,
-                    "stop_loss": stop_loss,
-                    "ttl": self.config.ORDER_TTL
-                }
-                self.orders_placed += 1
-                entry_discount = (close_price - limit_price) / close_price if close_price > 0 else 0
-                self.total_entry_discount += entry_discount
-                execution_type = "new_pending_buy" if not execution_type else execution_type
-            else:
-                # Cancel any pending buy if signal turns neutral/sell
-                self.pending_order = None
-        else:
+                
+                cost_per_share = limit_price * (1 + current_fee)
+                size = int(self.balance / cost_per_share) if cost_per_share > 0 else 0
+                
+                if size > 0:
+                    total_cost = size * cost_per_share
+                    self.balance -= total_cost
+                    self.locked_cash = total_cost
+                    self.pending_order = {
+                        "type": "buy",
+                        "size": size,
+                        "price": limit_price,
+                        "locked_cash": total_cost,
+                        "stop_loss": stop_loss,
+                        "ttl": self.config.ORDER_TTL
+                    }
+                    self.orders_placed += 1
+                    execution_type = "new_pending_buy" if not execution_type else execution_type
+                else:
+                    self.is_invalid_action = True
+        
+        elif self.active_position:
             # If Active Position: < -0.3 = Place SELL LIMIT (Exit)
             if signal < -0.3:
-                limit_price = self._calculate_limit_price(close_price, action[1], order_type="sell")
-                self.pending_order = {
-                    "type": "sell",
-                    "price": limit_price,
-                    "ttl": self.config.ORDER_TTL
-                }
-                self.orders_placed += 1
-                # For sell, "discount" is how much above close we are selling
-                entry_discount = (limit_price - close_price) / close_price if close_price > 0 else 0
-                self.total_entry_discount += entry_discount
-                execution_type = "new_pending_sell" if not execution_type else execution_type
+                if not self.pending_order:
+                    limit_price = self._calculate_limit_price(close_price, action[1], order_type="sell")
+                    self.pending_order = {
+                        "type": "sell",
+                        "price": limit_price,
+                        "ttl": self.config.ORDER_TTL
+                    }
+                    self.orders_placed += 1
+                    execution_type = "new_pending_sell" if not execution_type else execution_type
             elif signal > -0.3:
                 # Cancel pending Sell orders (Hold strategy)
                 if self.pending_order and self.pending_order["type"] == "sell":
@@ -757,7 +790,7 @@ class StockTradingEnv(gym.Env):
         else:
             self.holdings_value = 0
             
-        self.net_worth = self.balance + self.holdings_value
+        self.net_worth = self.balance + self.holdings_value + self.locked_cash
         
         # Update training step count
         self.global_step_count += 1
@@ -792,6 +825,7 @@ class StockTradingEnv(gym.Env):
             "net_worth": self.net_worth,
             "balance": self.balance,
             "shares_held": self.shares_held,
+            "locked_cash": self.locked_cash,
             "has_active": self.active_position is not None,
             "has_pending": self.pending_order is not None,
             "reward": reward,
@@ -828,7 +862,7 @@ class StockTradingEnv(gym.Env):
         1. Step Penalty: Efficiency incentive.
         2. Unrealized PnL: Logarithmic return of net worth.
         3. Realized PnL: On Exit, reward (Exit_Price - Entry_Price) / Entry_Price.
-        4. Fill Reward: Bonus when a Limit Order gets filled.
+        4. Order Rent: Penalty for keeping a pending order open.
         """
         reward = 0.0
         
@@ -844,7 +878,11 @@ class StockTradingEnv(gym.Env):
         # realized_pnl passed in is already (Exit - Entry) / Entry
         reward += realized_pnl
         
-        # 4. Fill Reward
+        # 4. Order Rent (The "No Free Lunch" Fix)
+        if self.pending_order is not None:
+            reward -= self.config.PENDING_ORDER_PENALTY
+            
+        # 5. Fill Reward (Now 0.0 by default in config)
         if fill_event:
             reward += self.config.FILL_REWARD
             
@@ -887,6 +925,7 @@ class StockTradingEnv(gym.Env):
         # Limit Order State Reset
         self.pending_order = None
         self.active_position = None
+        self.locked_cash = 0.0
         
         # Statistics Tracking
         self.orders_placed = 0
