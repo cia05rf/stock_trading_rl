@@ -33,8 +33,8 @@ def run_evaluation(
     end_date: str,
     model_path: Optional[str] = None,
     initial_balance: float = 10000.0,
-    spread: float = 0.00,
-    stamp_duty: float = 0.005,
+    buy_threshold: float = 0.3,
+    sell_threshold: float = -0.3,
     max_positions: int = 5,
     output_dir: Optional[str] = None,
     generate_plots: bool = True,
@@ -49,8 +49,8 @@ def run_evaluation(
         end_date: End date (YYYY-MM-DD)
         model_path: Path to model file (None = use latest)
         initial_balance: Starting capital
-        spread: Bid-ask spread percentage
-        stamp_duty: Stamp duty percentage
+        buy_threshold: Signal strength required to buy
+        sell_threshold: Signal strength required to sell
         max_positions: Maximum concurrent positions
         output_dir: Directory to save results
         generate_plots: Whether to generate visualization
@@ -74,15 +74,15 @@ def run_evaluation(
     fund = MockFund(
         infer=infer,
         initial_balance=initial_balance,
-        spread=spread,
-        stamp_duty=stamp_duty,
         max_holding_count=max_positions,
+        buy_threshold=buy_threshold,
+        sell_threshold=sell_threshold
     )
     
     # Run backtest
     logger.info(f"Running backtest: {start_date} to {end_date}")
     logger.info(f"Initial balance: £{initial_balance:,.2f}")
-    logger.info(f"Transaction costs: spread={spread*100:.1f}%, stamp_duty={stamp_duty*100:.1f}%")
+    logger.info(f"Thresholds -> Buy: >{buy_threshold}, Sell: <{sell_threshold}")
     
     results = fund.run_backtest(start_date, end_date)
     
@@ -216,16 +216,16 @@ def main():
         help="Initial balance in GBP",
     )
     parser.add_argument(
-        "--spread",
+        "--buy-threshold",
         type=float,
-        default=0.00,
-        help="Bid-ask spread percentage (0.00 = 0%%)",
+        default=0.3,
+        help="Signal strength required to buy",
     )
     parser.add_argument(
-        "--stamp-duty",
+        "--sell-threshold",
         type=float,
-        default=0.005,
-        help="Stamp duty percentage (0.005 = 0.5%%)",
+        default=-0.3,
+        help="Signal strength required to sell",
     )
     parser.add_argument(
         "--max-positions",
@@ -279,8 +279,8 @@ def main():
         end_date=args.end_date,
         model_path=args.model,
         initial_balance=args.balance,
-        spread=args.spread,
-        stamp_duty=args.stamp_duty,
+        buy_threshold=args.buy_threshold,
+        sell_threshold=args.sell_threshold,
         max_positions=args.max_positions,
         output_dir=args.output_dir,
         generate_plots=not args.no_plots,

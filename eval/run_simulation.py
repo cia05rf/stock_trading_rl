@@ -62,6 +62,8 @@ def run_simulation_cli():
         results = fund.run_backtest(args.start_date, args.end_date)
     except Exception as e:
         logger.error(f"Simulation failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         sys.exit(1)
 
     # Analysis

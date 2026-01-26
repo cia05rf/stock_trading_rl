@@ -8,8 +8,9 @@ data to evaluate model performance.
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
+from typing import Dict, List, Optional, Tuple, Literal, TypedDict, Set
+import numpy as np
+import torch
 import pandas as pd
 from tqdm import tqdm
 
@@ -19,6 +20,19 @@ from training.inference import Infer
 from training.data_ingestion import Ingestion, PricesDf
 
 logger = get_logger(__name__)
+
+# --- Type Definitions ---
+PrioritizationType = Literal["score", "signal"]
+
+class CandleData(TypedDict):
+    """Minimal schema for cached price data."""
+    open: float
+    high: float
+    low: float
+    close: float
+
+# Lookup structure: [Timestamp][Ticker] -> CandleData
+PriceLookup = Dict[pd.Timestamp, Dict[str, CandleData]]
 
 
 @dataclass
@@ -85,6 +99,9 @@ class MockFund:
         initial_balance: Optional[float] = None,
         tickers: Optional[List[str]] = None,
         max_holding_count: int = 5,
+        buy_threshold: float = 0.3,
+        sell_threshold: float = -0.3,
+        prioritize_by: PrioritizationType = "score",
     ):
         self.config = get_config()
         self.infer = infer or Infer()
@@ -93,10 +110,19 @@ class MockFund:
         self.initial_balance = self.balance
         self.tickers = tickers
         self.max_holding_count = max_holding_count
+        self.buy_threshold = buy_threshold
+        self.sell_threshold = sell_threshold
+        self.prioritize_by = prioritize_by
         
         # State
         self.active_limit_orders: List[Dict] = []
         self.open_positions: Dict[str, Dict] = {} # ticker -> position
+        
+        # Cache for vectorized inference & O(1) price access
+        self.feature_cache: Dict[pd.Timestamp, torch.Tensor] = {}
+        self.price_cache: PriceLookup = {}
+        self.ticker_index_map: Dict[str, int] = {}
+        self.ordered_tickers: List[str] = []
         
         # Stats
         self.orders_placed = 0
@@ -105,6 +131,91 @@ class MockFund:
         self.equity_curve: List[Dict] = []
         
         logger.info(f"MockFund (Limit Order) initialized with balance: £{self.balance:,.2f}")
+
+    def _preload_data(self, start_date: str, end_date: str) -> None:
+        """
+        Pre-load and vectorize feature data for all tickers in the date range.
+        Stores features in self.feature_cache[timestamp] and prices in self.price_cache.
+        """
+        logger.info(f"Pre-loading data for {len(self.tickers) if self.tickers else 'ALL'} tickers...")
+        
+        start_ts = pd.to_datetime(start_date)
+        end_ts = pd.to_datetime(end_date)
+        
+        # 1. Load and prepare all price data
+        prices = self.ingest.read_prices(self.tickers)
+        if prices.empty:
+            raise ValueError("No price data found for pre-loading.")
+            
+        # Standardize tickers and build index map
+        self.ordered_tickers = sorted(prices["ticker"].unique())
+        self.ticker_index_map = {ticker: i for i, ticker in enumerate(self.ordered_tickers)}
+        num_tickers = len(self.ordered_tickers)
+        
+        # 2. Build Price Cache (O(1) access)
+        logger.info("Indexing prices for O(1) access...")
+        # Filter strictly for date range to minimize memory usage
+        prices_subset = prices[(prices["date"] >= start_ts) & (prices["date"] <= end_ts)]
+        
+        for row in tqdm(prices_subset.itertuples(index=False), total=len(prices_subset), desc="Indexing Prices"):
+            ts: pd.Timestamp = row.date
+            ticker: str = row.ticker
+            
+            if ts not in self.price_cache:
+                self.price_cache[ts] = {}
+            
+            # Map raw_close to close if strictly needed, otherwise use close
+            close_price = getattr(row, "raw_close", getattr(row, "close", 0.0))
+            
+            self.price_cache[ts][ticker] = {
+                'open': getattr(row, "open", 0.0), 
+                'high': getattr(row, "high", 0.0), 
+                'low': getattr(row, "low", 0.0), 
+                'close': close_price
+            }
+        
+        # 3. Generate observations for each ticker and timestamp
+        # We'll use a temporary dict to store observations: [timestamp][ticker_idx] = obs_vector
+        obs_by_ts: Dict[pd.Timestamp, Dict[int, np.ndarray]] = {}
+        
+        # Use a temporary environment to generate observations consistently
+        temp_env = self.infer.env
+        
+        for ticker, df_t in tqdm(prices.groupby("ticker"), desc="Vectorizing Features"):
+            ticker_idx = self.ticker_index_map[ticker]
+            
+            # Prepare data same as environment and reset index for positional iloc access
+            prepared = PricesDf(df_t.copy()).prep_data().sort_values("date").reset_index(drop=True)
+            
+            temp_env.df = prepared
+            temp_env._precompute_features()
+            
+            if hasattr(temp_env, 'ticker_to_id') and ticker in temp_env.ticker_to_id:
+                temp_env.current_stock_id = temp_env.ticker_to_id[ticker]
+            
+            # Find indices for the requested range
+            mask = (prepared["date"] >= start_ts) & (prepared["date"] <= end_ts)
+            target_indices = prepared.index[mask]
+            
+            for idx in target_indices:
+                ts = prepared.iloc[idx]["date"]
+                temp_env.current_step = idx
+                obs = temp_env._next_observation()
+                
+                if ts not in obs_by_ts:
+                    obs_by_ts[ts] = {}
+                obs_by_ts[ts][ticker_idx] = obs
+
+        # 4. Convert to batched PyTorch tensors
+        obs_dim = temp_env.observation_space.shape[0]
+        
+        for ts, ticker_obs in tqdm(obs_by_ts.items(), desc="Creating Feature Tensors"):
+            batch_tensor = torch.zeros((num_tickers, obs_dim), dtype=torch.float32)
+            for ticker_idx, obs in ticker_obs.items():
+                batch_tensor[ticker_idx] = torch.from_numpy(obs)
+            self.feature_cache[ts] = batch_tensor
+            
+        logger.info(f"Pre-loaded {len(self.feature_cache)} timestamps for {num_tickers} tickers.")
 
     def _calculate_limit_price(self, close_price: float, action_val: float, order_type: str = "buy") -> float:
         """Formula: Limit_Price = Close * (1 - (abs(Action[1]) * MAX_LIMIT_OFFSET))"""
@@ -150,11 +261,14 @@ class MockFund:
     def _run_timestamp(
         self,
         timestamp: pd.Timestamp,
-        prices_by_ticker: Dict[str, PricesDf],
-        preds: Optional[pd.DataFrame] = None,
     ) -> None:
         """Run simulation for a single timestamp (15m candle)."""
         
+        # 0. Fast Price Lookup (O(1))
+        current_prices: Dict[str, CandleData] = self.price_cache.get(timestamp, {})
+        if not current_prices:
+            return
+
         # 1. Update Existing Limit Orders (TTL)
         for order in self.active_limit_orders[:]:
             order["ttl"] -= 1
@@ -162,17 +276,15 @@ class MockFund:
                 self.active_limit_orders.remove(order)
 
         # 2. Check for Fills and Stop Losses using current candle
-        # Logic: Stop Loss checked first (pessimistic)
-        for ticker in list(self.open_positions.keys()) + [o["ticker"] for o in self.active_limit_orders]:
-            if ticker not in prices_by_ticker:
+        active_order_tickers = {o["ticker"] for o in self.active_limit_orders}
+        open_position_tickers = set(self.open_positions.keys())
+        relevant_tickers: Set[str] = active_order_tickers.union(open_position_tickers)
+        
+        for ticker in relevant_tickers:
+            if ticker not in current_prices:
                 continue
             
-            ticker_df = prices_by_ticker[ticker]
-            candle_row = ticker_df[ticker_df["date"] == timestamp]
-            if candle_row.empty:
-                continue
-            
-            candle = candle_row.iloc[0]
+            candle = current_prices[ticker]
             high = candle["high"]
             low = candle["low"]
             
@@ -180,12 +292,11 @@ class MockFund:
             if ticker in self.open_positions:
                 pos = self.open_positions[ticker]
                 if low <= pos["stop_loss"]:
-                    # Stop loss hit: Pessimistic exit at stop_loss price or high if gap
                     exit_price = min(pos["stop_loss"], high)
                     self._liquidate(ticker, exit_price, timestamp, reason="stop_loss")
             
-            # 2b. Check Fills for Active Limit Orders (Only if no stop_loss hit just now)
-            if ticker not in self.open_positions:
+            # 2b. Check Fills for Active Limit Orders
+            elif ticker not in self.open_positions:
                 ticker_orders = [o for o in self.active_limit_orders if o["ticker"] == ticker]
                 for order in ticker_orders:
                     fill_price = order["price"]
@@ -208,99 +319,114 @@ class MockFund:
                         if order in self.active_limit_orders:
                             self.active_limit_orders.remove(order)
 
-        # 3. Process New Predictions
-        if preds is not None and not preds.empty:
-            # First, handle cancellations for tickers with pending orders
+        # 3. Process New Predictions (Batched Inference)
+        feature_tensor = self.feature_cache.get(timestamp)
+        if feature_tensor is not None:
+            actions = self.infer.get_batch_action(feature_tensor)
+            
             pending_tickers = {o["ticker"] for o in self.active_limit_orders}
-            for _, row in preds.iterrows():
-                ticker = row["ticker"]
-                signal = row["signal"]
-                
-                if ticker in pending_tickers:
-                    # Cancel if signal is neutral or opposite of order
-                    # For buy order: cancel if signal <= 0.3
-                    # For sell order: cancel if signal >= -0.3
-                    order = next(o for o in self.active_limit_orders if o["ticker"] == ticker)
-                    if (order["type"] == "buy" and signal <= 0.3) or \
-                       (order["type"] == "sell" and signal >= -0.3):
-                        self.active_limit_orders = [o for o in self.active_limit_orders if o["ticker"] != ticker]
-            
-            # Second, identify new order candidates
             new_candidates = []
-            for _, row in preds.iterrows():
-                ticker = row["ticker"]
-                signal = row["signal"]
-                
-                # Case A: No Position -> Potential Buy Limit
-                if ticker not in self.open_positions and ticker not in pending_tickers:
-                    if signal > 0.3:
-                        new_candidates.append(row)
-                
-                # Case B: Active Position -> Potential Sell Limit
-                elif ticker in self.open_positions and ticker not in pending_tickers:
-                    if signal < -0.3:
-                        new_candidates.append(row)
             
+            for i, ticker in enumerate(self.ordered_tickers):
+                # action: [signal, limit_offset, stop_loss]
+                action = actions[i]
+                signal = action[0]
+                
+                # 3a. Handle Cancellations
+                if ticker in pending_tickers:
+                    order = next(o for o in self.active_limit_orders if o["ticker"] == ticker)
+                    cancel_buy = (order["type"] == "buy" and signal <= self.buy_threshold)
+                    cancel_sell = (order["type"] == "sell" and signal >= self.sell_threshold)
+                    
+                    if cancel_buy or cancel_sell:
+                        self.active_limit_orders.remove(order)
+                        pending_tickers.remove(ticker)
+                        continue
+                
+                # 3b. Identify New Candidates
+                if ticker not in self.open_positions and ticker not in pending_tickers:
+                    if signal > self.buy_threshold:
+                        candle = current_prices.get(ticker)
+                        if candle:
+                            new_candidates.append({
+                                "ticker": ticker,
+                                "signal": signal,
+                                "close": candle["close"],
+                                "limit_offset_action": action[1],
+                                "stop_loss_action": action[2]
+                            })
+                
+                elif ticker in self.open_positions and ticker not in pending_tickers:
+                    if signal < self.sell_threshold:
+                        candle = current_prices.get(ticker)
+                        if candle:
+                            new_candidates.append({
+                                "ticker": ticker,
+                                "signal": signal,
+                                "close": candle["close"],
+                                "limit_offset_action": action[1],
+                                "stop_loss_action": action[2]
+                            })
+
+            # 3c. Rank and Issue Orders
             if new_candidates:
                 candidate_df = pd.DataFrame(new_candidates)
-                # Calculate ranking score: abs(Signal) * Predicted_Discount
-                candidate_df["predicted_discount"] = candidate_df.apply(
-                    lambda r: (
-                        (r["close"] - self._calculate_limit_price(
-                            r["close"], r["limit_offset_action"], "buy"
-                        )) / r["close"]
-                        if r["signal"] > 0.3 else
-                        (self._calculate_limit_price(
-                            r["close"], r["limit_offset_action"], "sell"
-                        ) - r["close"]) / r["close"]
-                    ),
-                    axis=1
+                
+                # Calculate Limit Prices
+                candidate_df["limit_buy"] = candidate_df.apply(
+                    lambda r: self._calculate_limit_price(r.close, r.limit_offset_action, "buy"), axis=1
                 )
-                candidate_df["score"] = (
-                    candidate_df["signal"].abs() * 
-                    candidate_df["predicted_discount"]
+                candidate_df["limit_sell"] = candidate_df.apply(
+                    lambda r: self._calculate_limit_price(r.close, r.limit_offset_action, "sell"), axis=1
                 )
-                candidate_df = candidate_df.sort_values("score", ascending=False)
+
+                # Prioritization Logic
+                if self.prioritize_by == "score":
+                    # Score = Signal Strength * Predicted Discount
+                    candidate_df["discount_pct"] = np.where(
+                        candidate_df["signal"] > 0,
+                        (candidate_df["close"] - candidate_df["limit_buy"]) / candidate_df["close"],
+                        (candidate_df["limit_sell"] - candidate_df["close"]) / candidate_df["close"]
+                    )
+                    candidate_df["ranking_score"] = candidate_df["signal"].abs() * candidate_df["discount_pct"]
+                else:
+                    # Score = Pure Signal Strength
+                    candidate_df["ranking_score"] = candidate_df["signal"].abs()
+
+                # Sort by score descending
+                candidate_df = candidate_df.sort_values("ranking_score", ascending=False)
                 
                 available_slots = (
                     self.max_holding_count - len(self.open_positions)
                 )
                 
-                for _, row in candidate_df.iterrows():
-                    ticker = row["ticker"]
-                    if row["signal"] > 0.3: # Buy candidate
+                for row in candidate_df.itertuples(index=False):
+                    ticker = row.ticker
+                    if row.signal > 0: # Buy Signal
                         if available_slots > 0:
-                            limit_price = self._calculate_limit_price(
-                                row["close"], row["limit_offset_action"], "buy"
-                            )
-                            stop_loss = self._calculate_stop_price(
-                                limit_price, row["stop_loss_action"]
-                            )
+                            stop_loss = self._calculate_stop_price(row.limit_buy, row.stop_loss_action)
                             self.active_limit_orders.append({
                                 "ticker": ticker,
                                 "type": "buy",
-                                "price": limit_price,
+                                "price": row.limit_buy,
                                 "stop_loss": stop_loss,
                                 "ttl": self.config.ORDER_TTL,
                                 "timestamp": timestamp
                             })
                             self.orders_placed += 1
                             available_slots -= 1
-                    else: # Sell candidate
-                        limit_price = self._calculate_limit_price(
-                            row["close"], row["limit_offset_action"], "sell"
-                        )
+                    else: # Sell Signal
                         self.active_limit_orders.append({
                             "ticker": ticker,
                             "type": "sell",
-                            "price": limit_price,
+                            "price": row.limit_sell,
                             "ttl": self.config.ORDER_TTL,
                             "timestamp": timestamp
                         })
                         self.orders_placed += 1
 
         # 4. Record Equity Snapshot
-        self._record_equity(timestamp, prices_by_ticker)
+        self._record_equity(timestamp)
 
     def _execute_fill(self, order: Dict, fill_price: float, timestamp: pd.Timestamp) -> None:
         """Convert filled order to position."""
@@ -339,7 +465,7 @@ class MockFund:
                     "type": "short",
                     "entry_price": fill_price,
                     "quantity": quantity,
-                    "stop_loss": order["stop_loss"]
+                    "stop_loss": 0.0 # Stop loss for short? 
                 }
                 self.orders_filled += 1
                 self.ledger.append(self._create_ledger_entry(
@@ -373,18 +499,18 @@ class MockFund:
             timestamp, ticker, reason, action_type, exit_price, pos["quantity"], pos["quantity"] * exit_price, balance_pre, self.balance, pnl, pnl_pct
         ))
 
-    def _record_equity(self, timestamp: pd.Timestamp, prices_by_ticker: Dict[str, PricesDf]) -> None:
+    def _record_equity(self, timestamp: pd.Timestamp) -> None:
         """Record fund net worth."""
         holdings_value = 0.0
+        current_prices = self.price_cache.get(timestamp, {})
+        
         for ticker, pos in self.open_positions.items():
-            if ticker in prices_by_ticker:
-                candle = prices_by_ticker[ticker][prices_by_ticker[ticker]["date"] == timestamp]
-                if not candle.empty:
-                    current_price = candle.iloc[0]["raw_close"]
-                    if pos["type"] == "long":
-                        holdings_value += pos["quantity"] * current_price
-                    else: # short
-                        holdings_value -= pos["quantity"] * current_price
+            if ticker in current_prices:
+                current_price = current_prices[ticker]["close"]
+                if pos["type"] == "long":
+                    holdings_value += pos["quantity"] * current_price
+                else: # short
+                    holdings_value -= pos["quantity"] * current_price
         
         total_equity = self.balance + holdings_value
         self.equity_curve.append({
@@ -403,36 +529,24 @@ class MockFund:
         start_ts = pd.to_datetime(start_date)
         end_ts = pd.to_datetime(end_date)
         
-        # Load prices
-        prices = self.ingest.read_prices(self.tickers)
-        if prices.empty:
-            raise ValueError("No price data found for backtest.")
-            
-        prices_by_ticker: Dict[str, PricesDf] = {}
-        for ticker, df in prices.groupby("ticker"):
-            prices_by_ticker[ticker] = PricesDf(df.copy()).prep_data().sort_values("date")
-            
-        # Get all predictions
-        preds_all = self.infer.predict_timespan(
-            start=start_ts, end=end_ts, tickers=self.tickers, buffer_days=30
-        )
-        preds_by_ts = {ts: df for ts, df in preds_all.groupby("date")} if not preds_all.empty else {}
+        # 1. Pre-load data (Vectorized features & Price cache)
+        self._preload_data(start_date, end_date)
         
-        # Get unique timestamps in range
-        in_range = prices[(prices["date"] >= start_ts) & (prices["date"] <= end_ts)]
-        timestamps = sorted(in_range["date"].unique())
+        # 2. Main Event Loop
+        timestamps = sorted(self.price_cache.keys())
         
         for ts in tqdm(timestamps, desc="Backtesting"):
-            ts_dt = pd.to_datetime(ts)
-            self._run_timestamp(ts_dt, prices_by_ticker, preds_by_ts.get(ts_dt))
+            self._run_timestamp(ts)
             
-        # Close remaining positions
+        # 3. Close remaining positions
         if self.open_positions:
             final_ts = timestamps[-1]
+            current_prices = self.price_cache.get(final_ts, {})
+            
             for ticker in list(self.open_positions.keys()):
-                ticker_df = prices_by_ticker[ticker]
-                last_price = ticker_df[ticker_df["date"] == final_ts].iloc[0]["raw_close"]
-                self._liquidate(ticker, last_price, final_ts, reason="close_all")
+                if ticker in current_prices:
+                    close_price = current_prices[ticker]["close"]
+                    self._liquidate(ticker, close_price, final_ts, reason="close_all")
                 
         return self._calculate_results(start_date, end_date)
 
@@ -474,6 +588,9 @@ def run_backtest(
     initial_balance: float = 10000,
     model_path: Optional[str] = None,
     output_path: Optional[str] = None,
+    buy_threshold: float = 0.3,
+    sell_threshold: float = -0.3,
+    prioritize_by: PrioritizationType = "score",
 ) -> BacktestResults:
     """
     Convenience function to run a backtest.
@@ -484,12 +601,21 @@ def run_backtest(
         initial_balance: Starting capital
         model_path: Path to model (optional)
         output_path: Path to save results CSV (optional)
+        buy_threshold: Signal strength required to buy
+        sell_threshold: Signal strength required to sell
+        prioritize_by: How to prioritize signals ("score" or "signal")
     
     Returns:
         BacktestResults
     """
     infer = Infer(model_path=model_path)
-    fund = MockFund(infer, initial_balance=initial_balance)
+    fund = MockFund(
+        infer, 
+        initial_balance=initial_balance,
+        buy_threshold=buy_threshold,
+        sell_threshold=sell_threshold,
+        prioritize_by=prioritize_by
+    )
     results = fund.run_backtest(start_date, end_date)
     
     if output_path:

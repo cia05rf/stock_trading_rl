@@ -54,30 +54,34 @@ def analyze_results(ledger_df: pd.DataFrame) -> Dict:
     total_return = final_balance - initial_balance
     return_pct = (total_return / initial_balance) * 100
     
-    # Per-trade P&L
-    pnl = ledger_df["balance_post_trade"] - ledger_df["balance_pre_trade"]
+    # Per-trade P&L - Use the explicit P&L column from ledger if available
+    # to avoid counting entry costs as "losses".
+    if "pnl" in ledger_df.columns:
+        pnl_series = ledger_df[ledger_df["pnl"] != 0]["pnl"]
+    else:
+        pnl_series = ledger_df["balance_post_trade"] - ledger_df["balance_pre_trade"]
     
     # Win rate
-    profitable_trades = len(pnl[pnl > 0])
-    losing_trades = len(pnl[pnl < 0])
+    profitable_trades = len(pnl_series[pnl_series > 0])
+    losing_trades = len(pnl_series[pnl_series < 0])
     win_rate = profitable_trades / total_trades if total_trades > 0 else 0
     
     # Profit Factor (gross profits / gross losses)
-    gross_profit = pnl[pnl > 0].sum() if len(pnl[pnl > 0]) > 0 else 0
-    gross_loss = abs(pnl[pnl < 0].sum()) if len(pnl[pnl < 0]) > 0 else 0
+    gross_profit = pnl_series[pnl_series > 0].sum() if len(pnl_series[pnl_series > 0]) > 0 else 0
+    gross_loss = abs(pnl_series[pnl_series < 0].sum()) if len(pnl_series[pnl_series < 0]) > 0 else 0
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
     
     # Average Win/Loss
-    avg_win = pnl[pnl > 0].mean() if len(pnl[pnl > 0]) > 0 else 0
-    avg_loss = abs(pnl[pnl < 0].mean()) if len(pnl[pnl < 0]) > 0 else 0
+    avg_win = pnl_series[pnl_series > 0].mean() if len(pnl_series[pnl_series > 0]) > 0 else 0
+    avg_loss = abs(pnl_series[pnl_series < 0].mean()) if len(pnl_series[pnl_series < 0]) > 0 else 0
     win_loss_ratio = avg_win / avg_loss if avg_loss > 0 else float('inf')
     
     # Expectancy (average profit per trade)
-    expectancy = pnl.mean()
+    expectancy = pnl_series.mean() if len(pnl_series) > 0 else 0
     
     # Largest win/loss
-    largest_win = pnl.max() if len(pnl) > 0 else 0
-    largest_loss = pnl.min() if len(pnl) > 0 else 0
+    largest_win = pnl_series.max() if len(pnl_series) > 0 else 0
+    largest_loss = pnl_series.min() if len(pnl_series) > 0 else 0
     
     # Calculate daily returns for risk metrics
     daily_returns = pd.Series(dtype=float)
@@ -146,7 +150,7 @@ def analyze_results(ledger_df: pd.DataFrame) -> Dict:
     max_consecutive_wins = 0
     max_consecutive_losses = 0
     
-    for p in pnl:
+    for p in pnl_series:
         if p > 0:
             consecutive_wins += 1
             consecutive_losses = 0

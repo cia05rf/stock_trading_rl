@@ -259,10 +259,9 @@ def train(
             n_epochs=config.EPOCHS,
             clip_range=0.2,
             ent_coef=ent_coef,
-            vf_coef=0.5,
+            vf_coef=0.75,
             max_grad_norm=0.5,
             tensorboard_log=str(config.TB_LOG_DIR),
-            tb_log_name=f"{run_dt}_ppo_stock_trading",
             gamma=0.99,
             gae_lambda=0.95,
             seed=seed,
@@ -346,6 +345,7 @@ def train(
             total_timesteps=actual_timesteps,
             callback=callbacks,
             progress_bar=True,
+            tb_log_name=f"{run_dt}_ppo_stock_trading",
         )
     except KeyboardInterrupt:
         logger.warning("Training interrupted by user")

@@ -141,6 +141,30 @@ class Infer:
         self.preds_df: Optional[PredsDf] = None
         self.market_action_counts_df: Optional[MarketSummaryDf] = None
 
+    def get_batch_action(self, features: torch.Tensor, state: Optional[Dict] = None) -> np.ndarray:
+        """
+        Perform batched inference for multiple tickers.
+        
+        Args:
+            features: Tensor of shape (Num_Tickers, Window_Size * Features_Per_Step)
+            state: Optional portfolio state (balance, holdings, etc.) - currently unused by model
+            
+        Returns:
+            Numpy array of actions (Num_Tickers, Action_Dim)
+        """
+        with torch.no_grad():
+            obs_tensor = features.to(self.device)
+            
+            # For batched inference on GPU, call the policy directly.
+            # SB3 ActorCriticPolicy.forward returns (actions, values, log_probs)
+            # We want actions.
+            actions, _, _ = self.model.policy(obs_tensor, deterministic=True)
+            
+            # Ensure actions are on CPU and converted to numpy for the simulation loop
+            if hasattr(actions, "cpu"):
+                return actions.cpu().numpy()
+            return np.asarray(actions)
+
     def _decode_action(
         self,
         action,
